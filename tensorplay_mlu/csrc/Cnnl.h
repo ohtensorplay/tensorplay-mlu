@@ -34,6 +34,10 @@ public:
     explicit TensorDesc(const Tensor& t);
     TensorDesc(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides,
                DType dtype);
+    // Descriptor for a tensor described in one of CNNL's named orders (the
+    // sizes are given in that order and the strides are inferred as
+    // contiguous).  The convolution operators only accept these orders.
+    TensorDesc(const std::vector<int64_t>& sizes, cnnlTensorLayout_t layout, DType dtype);
     ~TensorDesc();
     TensorDesc(TensorDesc&& other) noexcept : desc_(other.desc_) { other.desc_ = nullptr; }
     TensorDesc& operator=(TensorDesc&& other) noexcept;
@@ -46,6 +50,7 @@ public:
 private:
     void set(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides,
              DType dtype);
+    void set_layout(const std::vector<int64_t>& sizes, cnnlTensorLayout_t layout, DType dtype);
     cnnlTensorDescriptor_t desc_ = nullptr;
 };
 

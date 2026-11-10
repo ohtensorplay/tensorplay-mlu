@@ -40,6 +40,27 @@ TensorDesc::TensorDesc(const std::vector<int64_t>& sizes, const std::vector<int6
     set(sizes, strides, dtype);
 }
 
+TensorDesc::TensorDesc(const std::vector<int64_t>& sizes, cnnlTensorLayout_t layout,
+                       DType dtype) {
+    set_layout(sizes, layout, dtype);
+}
+
+void TensorDesc::set_layout(const std::vector<int64_t>& sizes, cnnlTensorLayout_t layout,
+                            DType dtype) {
+    const auto type = cnnl_dtype(dtype);
+    TP_CHECK(type.has_value(), "MLU: dtype ", toString(dtype), " has no CNNL equivalent");
+    TP_CHECK(sizes.size() <= static_cast<size_t>(kMaxCnnlDims),
+             "MLU: CNNL describes at most ", kMaxCnnlDims, " dimensions, got ", sizes.size());
+    TP_CNNL_CHECK(cnnlCreateTensorDescriptor(&desc_));
+    if (sizes.empty()) {
+        const int64_t one = 1;
+        TP_CNNL_CHECK(cnnlSetTensorDescriptorEx_v2(desc_, CNNL_LAYOUT_ARRAY, *type, 1, &one, &one));
+        return;
+    }
+    TP_CNNL_CHECK(cnnlSetTensorDescriptor_v2(desc_, layout, *type,
+                                             static_cast<int>(sizes.size()), sizes.data()));
+}
+
 void TensorDesc::set(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides,
                      DType dtype) {
     const auto type = cnnl_dtype(dtype);
