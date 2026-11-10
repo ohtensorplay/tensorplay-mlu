@@ -25,6 +25,8 @@ print(y.item())
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![TensorPlay](https://img.shields.io/badge/powered%20by-TensorPlay-orange)](https://github.com/lexing-2026/TensorPlay)
 
+<p align="center"><a href="./README.md"><strong>English</strong></a> · <a href="./README.zh.md">中文</a></p>
+
 ---
 
 ## What this is
@@ -45,10 +47,20 @@ under `~/.cache/tensorplay_extensions`.
 
 ## Installation
 
-Requirements:
+### Requirements
 
-- a Cambricon MLU card with the **Neuware toolkit** (`/usr/local/neuware`)
+- a Cambricon MLU card with the **Neuware toolkit** installed
+  (`CNToolkit`, `CNNL`, ... — see the Cambricon user manuals)
 - TensorPlay installed in the same environment (`pip install tensorplay`)
+
+### Environment variables
+
+```bash
+export NEUWARE_HOME=/usr/local/neuware   # Neuware toolkit install path
+export LD_LIBRARY_PATH=$NEUWARE_HOME/lib64:$LD_LIBRARY_PATH
+```
+
+### Install the package
 
 ```bash
 git clone https://github.com/ohtensorplay/tensorplay-mlu.git
@@ -57,12 +69,23 @@ pip install .            # or: pip install -e .
 ```
 
 `import tensorplay` auto-loads the backend through the `tensorplay.backends`
-entry point when `$NEUWARE_HOME` (default `/usr/local/neuware`) holds the
-toolkit.  You can also load it explicitly:
+entry point when `$NEUWARE_HOME` holds the toolkit.  You can also load it
+explicitly:
 
 ```python
 import tensorplay_mlu
 tensorplay_mlu.load()
+```
+
+### Verify
+
+```python
+import tensorplay as tp
+import tensorplay_mlu
+
+tensorplay_mlu.load()
+a = tp.randn(2, 3, device="mlu")
+print((a.abs().sum()).cpu().item())   # needs an MLU server
 ```
 
 ## Quick start
@@ -106,8 +129,19 @@ CNNL does not compute in (integers, `float64`) take the host path as well.
 
 `benchmark/bench_mlu_vs_torch.py` in the TensorPlay repository runs this
 backend against `torch + torch_mlu` on the same card, one framework per
-process, identical workloads.  Representative numbers on a Cambricon MLU
-card (MLU590 series, TF32 on both sides, median of 50 timed iterations):
+process, identical workloads.  The chart below shows the ratio on a
+Cambricon MLU card (MLU590 series, TF32 on both sides, median of 50 timed
+iterations); values below 1.00 mean TensorPlay is faster:
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/benchmark-ratio-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/benchmark-ratio.png">
+    <img src="docs/images/benchmark-ratio.png" alt="tensorplay-mlu vs torch_mlu benchmark ratio" width="720">
+  </picture>
+</p>
+
+Representative numbers:
 
 | Case | torch ms | tensorplay ms | tp/torch |
 | --- | ---: | ---: | ---: |
@@ -192,6 +226,23 @@ that still run on the host.
 | `tensorplay_mlu/csrc/Module.cpp` | C entry points: host fallbacks, memory statistics |
 | `tensorplay_mlu/csrc/NNKernels.cpp` | neural-network kernels: layer norm, dropout, embedding, NLL loss (forward/backward) |
 | `tests/` | kernel-by-kernel comparison against the host |
+
+## Versioning and compatibility
+
+`tensorplay-mlu` is versioned independently of TensorPlay (semver, see
+`pyproject.toml`).  It targets the out-of-tree device slot TensorPlay
+reserves for accelerators, so the two projects move at their own pace:
+
+| Component | Version / branch |
+| --- | --- |
+| `tensorplay-mlu` | `0.1.0` (this repository, `main`) |
+| TensorPlay | any release that ships the `PrivateUse1` slot (`pip install tensorplay`) |
+| Neuware toolkit | `CNToolkit` + `CNNL` from the Cambricon developer site |
+| Tested card | MLU590 series (virtualized, generic product name) |
+
+The native sources are compiled against the installed toolkit on first load
+and cached under `~/.cache/tensorplay_extensions`, so a `pip install -U
+tensorplay-mlu` picks up new kernels without rebuilding TensorPlay.
 
 ## Development
 
