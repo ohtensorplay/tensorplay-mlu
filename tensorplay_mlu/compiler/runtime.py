@@ -14,6 +14,7 @@ inputs lived on.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import tempfile
@@ -123,13 +124,21 @@ def _network_from_onnx(mm: Any, onnx_bytes: bytes) -> Any:
 
 
 def _build_config(mm: Any, settings: CompilationSettings) -> Any:
+    """The build configuration MagicMind consumes for one model.
+
+    Every knob is written the way the builder documents it, as a JSON
+    fragment handed to ``parse_from_string`` -- shapes are fixed (one
+    specialization per sample shape, keyed into the cache), the target
+    architectures are named, and the arithmetic precision is selected.
+    """
+
     config = mm.BuilderConfig()
-    if settings.mlu_archs is not None:
-        config.mlu_archs = list(settings.mlu_archs)
-    # Static shapes: one specialization per sample shape, keyed into the cache.
     assert config.parse_from_string('{"graph_shape_mutable":false}').ok()
-    precision = (
-        '{"precision_config":{"precision_mode":"' + settings.precision_mode + '"}}'
+    if settings.mlu_archs is not None:
+        archs = json.dumps({"archs": list(settings.mlu_archs)})
+        assert config.parse_from_string(archs).ok()
+    precision = json.dumps(
+        {"precision_config": {"precision_mode": settings.precision_mode}}
     )
     assert config.parse_from_string(precision).ok()
     return config
