@@ -124,11 +124,38 @@ The backend implements the hot paths natively on CNNL:
 | Unary | `exp`, `log`, `sqrt`, `pow`, activations (`relu`, `gelu`, `sigmoid`, ...) and their backward kernels |
 | Blas | `mm`, `addmm`, `bmm`, `matmul`, `linear` (transposes read in place, cached algorithms) |
 | Reduce | `sum`, `mean`, `amax`/`amin`, `softmax`/`log_softmax` with backward |
+| Distributed | `all_reduce`, `broadcast`, `reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, `gather`/`scatter`, `send`/`recv`, `barrier` on the `cncl` backend |
 | Profiling | per-operation device time, kernel-level records through CNPAPI |
 
 Everything else runs on the host through
 `cpu_fallback::register_host_fallbacks`, so **every model runs**; data types
 CNNL does not compute in (integers, `float64`) take the host path as well.
+
+## Distributed (CNCL)
+
+`dist.init_process_group("cncl")` selects a process group that runs the
+collectives over Cambricon **CNCL** on MLU tensors.  The backend registers
+itself when the extension loads, so no extra import or environment variable is
+needed:
+
+```python
+import tensorplay as tp
+import tensorplay_mlu
+
+tensorplay_mlu.load()
+import tensorplay.distributed as dist
+
+dist.init_process_group("cncl", init_method="env://")
+x = tp.ones(4, device="mlu") * dist.get_rank()
+dist.all_reduce(x, op=dist.ReduceOp.SUM)
+dist.destroy_process_group()
+```
+
+Launch one process per card (`torchrun`-style `RANK` / `WORLD_SIZE` /
+`MASTER_ADDR` / `MASTER_PORT`), or use `tp.distributed.run`.  `AVG` is realized
+as a `SUM` followed by a scale, and `PRODUCT` reductions follow CNCL's
+conventions.  `monitored_barrier` and receiving from any source are not
+available and raise.
 
 ## Graph compilation (MagicMind)
 
@@ -216,6 +243,40 @@ BENCH_FP32_PRECISION=high python benchmark/bench_mlu_vs_torch.py --per-case
 > like-for-like comparison; set `BENCH_FP32_PRECISION=highest` to force full
 > float32 on the TensorPlay side.
 
+### Distributed scaling
+
+`benchmark/bench_mlu_distributed.py` in the TensorPlay repository runs one
+data-parallel training step (a 1024→4096→1024 MLP, gradients averaged with
+`all_reduce`) and reports the throughput as cards are added.  Two MLU cards,
+one process each, interconnected over the host network (no InfiniBand
+available), with the same per-rank batch on one and two cards:
+
+| per-rank batch | cards | step ms | samples/s | speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1 | 1.11 | 463k | — |
+| 512 | 2 | 12.3 | 83k | 0.18× |
+| 4096 | 1 | 5.48 | 748k | — |
+| 4096 | 2 | 16.6 | 492k | 0.66× |
+| 16384 | 1 | 20.9 | 783k | — |
+| 16384 | 2 | 32.1 | 1.02M | 1.30× |
+
+The crossover is set by the gradient exchange: this MLP has about 8.4M
+parameters, so every step all-reduces roughly 33 MB, which costs around
+10 ms over this interconnect regardless of the batch size.  Below a few
+thousand samples per rank the exchange dominates and the second card only
+slows the step down; from roughly 16k samples per rank the step is again
+compute-bound and two cards reach 1.30× (65% of the ideal 2×).  A faster
+interconnect moves the crossover to smaller batches.  One-card
+throughput alone saturates near 0.78M samples/s once the batch clears
+about 16k.
+
+Reproduce with one process per card:
+
+```bash
+RANK=0 WORLD_SIZE=2 MASTER_ADDR=<rank-0-host> MASTER_PORT=<free-port> \
+  python benchmark/bench_mlu_distributed.py --global-batch 32768 --json out.json
+```
+
 ## Generic product names
 
 CNNL selects its kernels and tiling tables by the product name the driver
@@ -265,6 +326,12 @@ that still run on the host.
 | `tensorplay_mlu/csrc/UnaryKernels.cpp` | exp/log/sqrt/..., `pow`, activations and their backward kernels |
 | `tensorplay_mlu/csrc/BlasKernels.cpp` | `mm`, `addmm`, `bmm`, `matmul`, `linear` |
 | `tensorplay_mlu/csrc/ReduceKernels.cpp` | `sum`, `mean`, `amax`/`amin`, softmax/log-softmax with backward |
+| `tensorplay_mlu/csrc/ConvKernels.cpp` | convolutions (1D/2D/3D, transposed, dilated, grouped) with backward |
+| `tensorplay_mlu/csrc/PoolKernels.cpp` | max/average pooling (1D/2D/3D) and adaptive variants with backward |
+| `tensorplay_mlu/csrc/BatchNormKernels.cpp` | batch normalization in training and evaluation |
+| `tensorplay_mlu/csrc/IndexKernels.cpp` | indexing, scatter, gather, scan and `where` |
+| `tensorplay_mlu/csrc/Cncl.cpp` | CNCL collective entry points over MLU device pointers |
+| `tensorplay_mlu/distributed.py` | the `cncl` process group that drives them |
 | `tensorplay_mlu/csrc/MLUProfiler.cpp` | profiler device time: a notifier pair around each operation |
 | `tensorplay_mlu/csrc/MLUActivity.cpp` | profiler kernel-level records through CNPAPI |
 | `tensorplay_mlu/csrc/Module.cpp` | C entry points: host fallbacks, memory statistics |

@@ -120,10 +120,34 @@ print(z.cpu().shape, float(loss.cpu()))
 | 一元 | `exp`、`log`、`sqrt`、`pow`、激活（`relu`、`gelu`、`sigmoid` 等）及其反向内核 |
 | Blas | `mm`、`addmm`、`bmm`、`matmul`、`linear`（原地读转置、算法缓存） |
 | 归约 | `sum`、`mean`、`amax`/`amin`、`softmax`/`log_softmax` 及反向 |
+| 分布式 | 在 `cncl` 后端上的 `all_reduce`、`broadcast`、`reduce`、`all_gather`、`reduce_scatter`、`all_to_all`、`gather`/`scatter`、`send`/`recv`、`barrier` |
 | 性能剖析 | 逐算子设备时间、通过 CNPAPI 的内核级记录 |
 
 其余算子通过 `cpu_fallback::register_host_fallbacks` 在主机上运行，因此
 **任何模型都能跑通**；CNNL 不支持的数据类型（整数、`float64`）同样走主机路径。
+
+## 分布式（CNCL）
+
+`dist.init_process_group("cncl")` 选择在 MLU 张量上经由寒武纪 **CNCL** 执行集合
+通信的进程组。该后端在扩展加载时自行注册，无需额外 import 或环境变量：
+
+```python
+import tensorplay as tp
+import tensorplay_mlu
+
+tensorplay_mlu.load()
+import tensorplay.distributed as dist
+
+dist.init_process_group("cncl", init_method="env://")
+x = tp.ones(4, device="mlu") * dist.get_rank()
+dist.all_reduce(x, op=dist.ReduceOp.SUM)
+dist.destroy_process_group()
+```
+
+每个卡起一个进程（`torchrun` 风格的 `RANK` / `WORLD_SIZE` / `MASTER_ADDR` /
+`MASTER_PORT`），或使用 `tp.distributed.run`。`AVG` 由 `SUM` 加一次缩放实现，
+`PRODUCT` 归约遵循 CNCL 的约定。`monitored_barrier` 与任意源接收不可用，会直接
+报错。
 
 ## 图编译（MagicMind）
 
@@ -206,6 +230,35 @@ BENCH_FP32_PRECISION=high python benchmark/bench_mlu_vs_torch.py --per-case
 > （`BENCH_FP32_PRECISION=high`）以做同精度对比；设置为
 > `BENCH_FP32_PRECISION=highest` 可强制 TensorPlay 一侧使用全精度 float32。
 
+### 分布式加速比
+
+`benchmark/bench_mlu_distributed.py`（位于 TensorPlay 仓库）跑一个数据并行训练步
+（1024→4096→1024 的 MLP，梯度用 `all_reduce` 求平均），并报告随卡数增加的吞吐。
+下表用两张 MLU 卡、每卡一个进程，走主机网络互联（无 InfiniBand），
+在同样每卡 batch 下对比单卡与双卡：
+
+| 每卡 batch | 卡数 | 单步 ms | samples/s | 加速比 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1 | 1.11 | 463k | — |
+| 512 | 2 | 12.3 | 83k | 0.18× |
+| 4096 | 1 | 5.48 | 748k | — |
+| 4096 | 2 | 16.6 | 492k | 0.66× |
+| 16384 | 1 | 20.9 | 783k | — |
+| 16384 | 2 | 32.1 | 1.02M | 1.30× |
+
+分水岭由梯度交换决定：该 MLP 约 840 万参数，因此每步要 all_reduce 约 33 MB，
+在这条互联上无论 batch 多大都约需 10 ms。每卡样本数在几千以下时交换占主导，
+加卡只会更慢；每卡约 16k 样本起单步重新变成计算受限，双卡达到 1.30×
+（理想 2× 的 65%）。更快的互联会把分水岭推向更小的 batch。单卡吞吐在 batch
+超过约 16k 后饱和于 0.78M samples/s。
+
+用每卡一个进程复现：
+
+```bash
+RANK=0 WORLD_SIZE=2 MASTER_ADDR=<rank-0主机> MASTER_PORT=<空闲端口> \
+  python benchmark/bench_mlu_distributed.py --global-batch 32768 --json out.json
+```
+
 ## 通用产品名问题
 
 CNNL 会根据驱动上报的产品名选择内核与分块参数。虚拟化或改名的卡可能上报通用名
@@ -249,6 +302,12 @@ print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 | `tensorplay_mlu/csrc/UnaryKernels.cpp` | exp/log/sqrt/...、`pow`、激活及其反向内核 |
 | `tensorplay_mlu/csrc/BlasKernels.cpp` | `mm`、`addmm`、`bmm`、`matmul`、`linear` |
 | `tensorplay_mlu/csrc/ReduceKernels.cpp` | `sum`、`mean`、`amax`/`amin`、softmax/log-softmax 及反向 |
+| `tensorplay_mlu/csrc/ConvKernels.cpp` | 卷积（1D/2D/3D、转置、膨胀、分组）及反向 |
+| `tensorplay_mlu/csrc/PoolKernels.cpp` | 最大/平均池化（1D/2D/3D）与自适应变体及反向 |
+| `tensorplay_mlu/csrc/BatchNormKernels.cpp` | 训练与推理下的批归一化 |
+| `tensorplay_mlu/csrc/IndexKernels.cpp` | 索引、scatter、gather、scan 与 `where` |
+| `tensorplay_mlu/csrc/Cncl.cpp` | 面向 MLU 设备指针的 CNCL 集合通信入口 |
+| `tensorplay_mlu/distributed.py` | 驱动上述入口的 `cncl` 进程组 |
 | `tensorplay_mlu/csrc/MLUProfiler.cpp` | 剖析器设备时间：每个算子前后一对 notifier |
 | `tensorplay_mlu/csrc/MLUActivity.cpp` | 通过 CNPAPI 的剖析器内核级记录 |
 | `tensorplay_mlu/csrc/Module.cpp` | C 入口点：主机 fallback、内存统计 |
