@@ -99,20 +99,21 @@ CNNL does not compute in (integers, `float64`) take the host path as well.
 `benchmark/bench_mlu_vs_torch.py` in the TensorPlay repository runs this
 backend against `torch + torch_mlu` on the same card, one framework per
 process, identical workloads.  Representative numbers on a Cambricon MLU
-card (MLU590 series, full fp32 precision):
+card (MLU590 series, TF32 on both sides, median of 50 timed iterations):
 
-| Case | torch ms | tensorplay-ms | tp/torch |
+| Case | torch ms | tensorplay ms | tp/torch |
 | --- | ---: | ---: | ---: |
-| mm 4096 fp32 | 1.69 | 1.6 | ~1.0 |
-| add 4096² fp32 | 0.37 | 0.38 | 1.00 |
-| relu 4096² fp32 | 0.15 | 0.14 | 0.96 |
-| gelu 4096² fp32 | 0.21 | 0.20 | 0.98 |
-| softmax 4096² fp32 | 0.21 | 0.20 | 0.98 |
-| sum_all 4096² fp32 | 0.09 | 0.08 | 0.82 |
-| bmm 32×512×64×512 fp32 | 0.07 | 0.07 | 0.99 |
-| h2d 64 MiB | 5.10 | 5.01 | 0.98 |
-| d2h 64 MiB | 26.6 | 5.4 | 0.20 |
-| mlp train step fp32 | 0.81 | 0.61 | 0.75 |
+| mm 4096 fp32 | 1.72 | 1.71 | 0.99 |
+| mm 1024 fp32 | 0.07 | 0.07 | 0.91 |
+| add 4096² fp32 | 0.38 | 0.38 | 1.00 |
+| relu 4096² fp32 | 0.15 | 0.14 | 0.97 |
+| gelu 4096² fp32 | 0.21 | 0.20 | 0.96 |
+| softmax 4096² fp32 | 0.21 | 0.20 | 0.97 |
+| sum_all 4096² fp32 | 0.10 | 0.08 | 0.88 |
+| bmm 32×512×64×512 fp32 | 0.07 | 0.07 | 1.00 |
+| h2d 64 MiB | 5.10 | 5.03 | 0.99 |
+| d2h 64 MiB | 26.7 | 5.6 | 0.21 |
+| mlp train step fp32 | 0.82 | 0.50 | 0.60 |
 
 Elementwise, reduction and memory operators are as fast as or faster than
 `torch_mlu`; host→device copies match it and **device→host copies are about
