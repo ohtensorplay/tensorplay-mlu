@@ -9,11 +9,25 @@ description = "Cambricon MLU device backend for TensorPlay"
 requires-python = ">=3.10"
 dependencies = ["tensorplay"]
 readme = "README.md"
+license = { file = "LICENSE" }
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: C++",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 [project.urls]
 Homepage = "https://github.com/ohtensorplay/tensorplay-mlu"
 Repository = "https://github.com/ohtensorplay/tensorplay-mlu"
 TensorPlay = "https://github.com/lexing-2026/TensorPlay"
+Documentation = "https://github.com/lexing-2026/TensorPlay/blob/main/docs/source/notes/backends.md"
 
 # `import tensorplay` loads the backend when the Neuware toolkit is present.
 [project.entry-points."tensorplay.backends"]

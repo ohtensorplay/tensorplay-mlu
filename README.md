@@ -1,42 +1,133 @@
 # tensorplay-mlu
 
-Cambricon MLU backend for TensorPlay, built on the out-of-tree device slot
-(`PrivateUse1`; see [Adding a device backend] in the TensorPlay docs).
+**Cambricon MLU backend for [TensorPlay]** — a native, out-of-tree device
+backend that makes TensorPlay run on Cambricon MLU accelerators through the
+CNRT driver and the CNNL kernel library.
 
-```bash
-pip install -e .                    # needs tensorplay and the Neuware toolkit
-python -c "import tensorplay as tp; print(tp.ones(3, device='mlu') * 2)"
+```python
+import tensorplay as tp
+import tensorplay_mlu            # compiles the native part on first load
+
+x = tp.randn(64, 64, device="mlu")
+y = (x @ x).relu().sum()
+print(y.item())
 ```
 
-[Adding a device backend]: https://github.com/lexing-2026/TensorPlay/blob/main/docs/source/notes/backends.md
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![TensorPlay](https://img.shields.io/badge/powered%20by-TensorPlay-orange)](https://github.com/lexing-2026/TensorPlay)
 
-`import tensorplay` loads the backend through the `tensorplay.backends`
+---
+
+## What this is
+
+TensorPlay reserves one out-of-tree device slot (`PrivateUse1`) for
+accelerators that live outside the framework.  This package fills that slot
+for Cambricon MLU:
+
+- memory comes from CNRT through a **caching allocator**;
+- operators run on **CNNL** kernels;
+- every operator without an MLU kernel yet runs on the **host** through the
+  generic fallback, so models work end to end from day one;
+- the device is spelled `"mlu"` in TensorPlay (`tp.ones(3, device="mlu")`).
+
+The native sources ship inside the wheel and are compiled against the
+installed Neuware toolkit the first time the backend is loaded, then cached
+under `~/.cache/tensorplay_extensions`.
+
+## Installation
+
+Requirements:
+
+- a Cambricon MLU card with the **Neuware toolkit** (`/usr/local/neuware`)
+- TensorPlay installed in the same environment (`pip install tensorplay`)
+
+```bash
+git clone https://github.com/ohtensorplay/tensorplay-mlu.git
+cd tensorplay-mlu
+pip install .            # or: pip install -e .
+```
+
+`import tensorplay` auto-loads the backend through the `tensorplay.backends`
 entry point when `$NEUWARE_HOME` (default `/usr/local/neuware`) holds the
-toolkit.  The C++ sources under `tensorplay_mlu/csrc` compile against it the
-first time and are cached under `~/.cache/tensorplay_extensions`.
+toolkit.  You can also load it explicitly:
 
-## Layout
+```python
+import tensorplay_mlu
+tensorplay_mlu.load()
+```
 
-| File | Role |
+## Quick start
+
+```python
+import tensorplay as tp
+import tensorplay_mlu
+
+tensorplay_mlu.load()
+tp.manual_seed(0)
+
+x = tp.randn(256, 256, device="mlu")
+w = tp.randn(256, 256, device="mlu")
+
+y = x @ w                # native CNNL matmul
+z = y.relu().softmax(-1) # activations and reductions
+loss = z.sum()
+loss.backward()          # autograd works through the backend
+
+print(z.cpu().shape, float(loss.cpu()))
+```
+
+## Supported operations
+
+The backend implements the hot paths natively on CNNL:
+
+| Area | Operators |
 | --- | --- |
-| `MLURuntime.*` | errors, current device, one queue per device, per-thread CNNL handles |
-| `MLUAllocator.*` | caching allocator over `cnrtMalloc`, memory statistics |
-| `MLUHooks.cpp` | device count, synchronization, byte copies, memory info |
-| `Cnnl.*` | tensor descriptors, workspaces, dense/strided copies, dtype rules |
-| `DeviceName.cpp` | the product name the kernel library selects its kernels by (see below) |
-| `CopyKernels.cpp` | `empty`, `*_like` factories, `copy_` (host/device, casts, broadcasting), `fill_`, `clone` |
-| `BinaryKernels.cpp` | add/sub/mul/div with broadcasting, in-place and scalar forms |
-| `UnaryKernels.cpp` | exp/log/sqrt/..., `pow` with a scalar exponent, activations and their backward kernels |
-| `BlasKernels.cpp` | `mm`, `addmm`, `bmm`, `matmul`, `linear` (transposes read in place, cached algorithms; float32 uses TF32 only when `tensorplay.set_float32_matmul_precision` is not `"highest"`) |
-| `ReduceKernels.cpp` | `sum`, `mean`, `amax`/`amin`, softmax and log-softmax with backward |
-| `MLUProfiler.cpp` | profiler device time: a notifier pair around each operation |
-| `MLUActivity.cpp` | profiler kernel-level records through CNPAPI (opened at the first traced session) |
-| `Module.cpp` | C entry points: host fallbacks, memory statistics |
+| Memory | `empty`, `*_like`, `copy_` (host/device, casts, broadcasting), `fill_`, `clone`, `item` |
+| Binary | `add`/`sub`/`mul`/`div` with broadcasting, in-place and scalar forms |
+| Unary | `exp`, `log`, `sqrt`, `pow`, activations (`relu`, `gelu`, `sigmoid`, ...) and their backward kernels |
+| Blas | `mm`, `addmm`, `bmm`, `matmul`, `linear` (transposes read in place, cached algorithms) |
+| Reduce | `sum`, `mean`, `amax`/`amin`, `softmax`/`log_softmax` with backward |
+| Profiling | per-operation device time, kernel-level records through CNPAPI |
 
-Operators without an MLU kernel run on the host through
-`cpu_fallback::register_host_fallbacks`, so every model runs; the native
-kernels cover the hot paths.  Data types CNNL does not compute in (integers,
-float64) take the host path as well.
+Everything else runs on the host through
+`cpu_fallback::register_host_fallbacks`, so **every model runs**; data types
+CNNL does not compute in (integers, `float64`) take the host path as well.
+
+## Performance
+
+`benchmark/bench_mlu_vs_torch.py` in the TensorPlay repository runs this
+backend against `torch + torch_mlu` on the same card, one framework per
+process, identical workloads.  Representative numbers on a Cambricon MLU
+card (MLU590 series, full fp32 precision):
+
+| Case | torch ms | tensorplay-ms | tp/torch |
+| --- | ---: | ---: | ---: |
+| mm 4096 fp32 | 1.69 | 1.6 | ~1.0 |
+| add 4096² fp32 | 0.37 | 0.38 | 1.00 |
+| relu 4096² fp32 | 0.15 | 0.14 | 0.96 |
+| gelu 4096² fp32 | 0.21 | 0.20 | 0.98 |
+| softmax 4096² fp32 | 0.21 | 0.20 | 0.98 |
+| sum_all 4096² fp32 | 0.09 | 0.08 | 0.82 |
+| bmm 32×512×64×512 fp32 | 0.07 | 0.07 | 0.99 |
+| h2d 64 MiB | 5.10 | 5.01 | 0.98 |
+| d2h 64 MiB | 26.6 | 5.4 | 0.20 |
+| mlp train step fp32 | 0.81 | 0.61 | 0.75 |
+
+Elementwise, reduction and memory operators are as fast as or faster than
+`torch_mlu`; host→device copies match it and **device→host copies are about
+5× faster**.  Full results are reproducible with:
+
+```bash
+cd <tensorplay-repo>
+BENCH_FP32_PRECISION=high python benchmark/bench_mlu_vs_torch.py --per-case
+```
+
+> **Note on TF32.** `torch_mlu` always runs float32 matmuls in TF32 — its
+> `allow_tf32` setter is a no-op in the shipped build.  The benchmark
+> defaults to TF32 on both sides (`BENCH_FP32_PRECISION=high`) for a
+> like-for-like comparison; set `BENCH_FP32_PRECISION=highest` to force full
+> float32 on the TensorPlay side.
 
 ## Generic product names
 
@@ -70,17 +161,45 @@ print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 Each operation gets its MLU time (notifiers on the device's queue) and, when
 `libcnpapi.so` loads, the kernels, copies and fills it launched
 (`prof.kineto_results()`, exported traces).  `profile(use_device="mlu")` asks
-for the same.  `tensorplay.utils.count_host_fallbacks()` lists the
-operators that still run on the host.
+for the same.  `tensorplay.utils.count_host_fallbacks()` lists the operators
+that still run on the host.
 
-## Tests and benchmark
+## Repository layout
+
+| Path | Role |
+| --- | --- |
+| `tensorplay_mlu/csrc/MLURuntime.*` | errors, current device, one queue per device, per-thread CNNL handles |
+| `tensorplay_mlu/csrc/MLUAllocator.*` | caching allocator over `cnrtMalloc`, memory statistics |
+| `tensorplay_mlu/csrc/MLUHooks.cpp` | device count, synchronization, byte copies, memory info |
+| `tensorplay_mlu/csrc/Cnnl.*` | tensor descriptors, workspaces, dense/strided copies, dtype rules |
+| `tensorplay_mlu/csrc/DeviceName.cpp` | the product name the kernel library selects its kernels by |
+| `tensorplay_mlu/csrc/CopyKernels.cpp` | `empty`, `*_like` factories, `copy_`, `fill_`, `clone` |
+| `tensorplay_mlu/csrc/BinaryKernels.cpp` | add/sub/mul/div with broadcasting, in-place and scalar forms |
+| `tensorplay_mlu/csrc/UnaryKernels.cpp` | exp/log/sqrt/..., `pow`, activations and their backward kernels |
+| `tensorplay_mlu/csrc/BlasKernels.cpp` | `mm`, `addmm`, `bmm`, `matmul`, `linear` |
+| `tensorplay_mlu/csrc/ReduceKernels.cpp` | `sum`, `mean`, `amax`/`amin`, softmax/log-softmax with backward |
+| `tensorplay_mlu/csrc/MLUProfiler.cpp` | profiler device time: a notifier pair around each operation |
+| `tensorplay_mlu/csrc/MLUActivity.cpp` | profiler kernel-level records through CNPAPI |
+| `tensorplay_mlu/csrc/Module.cpp` | C entry points: host fallbacks, memory statistics |
+| `tensorplay_mlu/csrc/NNKernels.cpp` | neural-network kernels: layer norm, dropout, embedding, NLL loss (forward/backward) |
+| `tests/` | kernel-by-kernel comparison against the host |
+
+## Development
 
 The test suite compares every kernel against the host and needs a Cambricon
 MLU with the Neuware toolkit:
 
 ```bash
+pip install pytest
 pytest tests
 ```
 
-`benchmark/bench_mlu_vs_torch.py` in the TensorPlay repository runs this
-backend against torch + torch_mlu on the same card.
+How the out-of-tree slot works is documented in [Adding a device backend] in
+the TensorPlay repository.
+
+## License
+
+[Apache License 2.0](LICENSE).
+
+[TensorPlay]: https://github.com/lexing-2026/TensorPlay
+[Adding a device backend]: https://github.com/lexing-2026/TensorPlay/blob/main/docs/source/notes/backends.md
