@@ -412,3 +412,93 @@ def test_memory_statistics():
     assert tp.mlu.memory_reserved() >= before
     free, total = tp.mlu.mem_get_info()
     assert 0 < free <= total
+
+
+# -- indexing, scatter, scans, where -------------------------------------------
+
+def indices(*shape, high, seed=7):
+    tp.manual_seed(seed)
+    return tp.randint(0, high, shape)
+
+
+@pytest.mark.parametrize("dtype", DTYPES + [tp.int32])
+def test_gather_and_scatter(dtype):
+    # int32 values are exact, so the host comparison uses the float tolerance.
+    tol = dtype if dtype in TOL else tp.float32
+    if dtype == tp.int32:
+        x = tp.arange(20, dtype=tp.float32).reshape(4, 5).to(dtype)
+        src = tp.arange(20, dtype=tp.float32).reshape(4, 5).to(dtype)
+    else:
+        x = rand(4, 5, dtype=dtype, seed=21)
+        src = rand(4, 5, dtype=dtype, seed=22)
+    idx = indices(4, 5, high=5, seed=23)
+    xm, sm, im = x.to("mlu"), src.to("mlu"), idx.to("mlu")
+    close(tp.gather(xm, 1, im), tp.gather(x, 1, idx), tol)
+    idx0 = indices(2, 5, high=4, seed=24)
+    close(tp.gather(xm, 0, idx0.to("mlu")), tp.gather(x, 0, idx0), tol)
+    rows = indices(3, high=4, seed=25)
+    close(tp.index_select(xm, 0, rows.to("mlu")), tp.index_select(x, 0, rows), tol)
+    close(tp.scatter_add(xm, 1, im, sm), tp.scatter_add(x, 1, idx, src), tol)
+    close(tp.scatter(xm, 1, im, sm), tp.scatter(x, 1, idx, src), tol)
+    d, ref = xm.clone(), x.clone()
+    d.scatter_add_(1, im, sm)
+    ref.scatter_add_(1, idx, src)
+    close(d, ref, tol)
+
+
+@pytest.mark.parametrize("include_self", (True, False))
+def test_scatter_reduce(include_self):
+    x = rand(4, 5, seed=26)
+    src = rand(4, 5, seed=27)
+    idx = indices(4, 5, high=5, seed=28)
+    xm, sm, im = x.to("mlu"), src.to("mlu"), idx.to("mlu")
+    for reduce in ("sum", "amax", "amin"):
+        close(tp.scatter_reduce(xm, 1, im, sm, reduce, include_self=include_self),
+              tp.scatter_reduce(x, 1, idx, src, reduce, include_self=include_self))
+
+
+def test_scatter_reduce_unsupported_reduce_takes_the_host_path():
+    x = rand(4, 5, seed=29)
+    src = rand(4, 5, seed=30)
+    idx = indices(4, 5, high=5, seed=31)
+    close(tp.scatter_reduce(x.to("mlu"), 1, idx.to("mlu"), src.to("mlu"), "prod"),
+          tp.scatter_reduce(x, 1, idx, src, "prod"))
+
+
+def test_cumsum_and_cumprod():
+    for dtype in DTYPES:
+        x = rand(6, 7, dtype=dtype, seed=32)
+        close(tp.cumsum(x.to("mlu"), 1), tp.cumsum(x, 1), dtype)
+    x = rand(6, 7, seed=33)
+    close(tp.cumsum(x.to("mlu"), 0), tp.cumsum(x, 0))
+    close(tp.cumprod(x.to("mlu"), 0), tp.cumprod(x, 0))
+    d = x.to("mlu")
+    d.cumsum_(1)
+    close(d, tp.cumsum(x, 1))
+    ints = tp.arange(12, dtype=tp.int64).reshape(3, 4)
+    close(tp.cumsum(ints.to("mlu"), 1), tp.cumsum(ints, 1))
+
+
+def test_where():
+    cond = rand(4, 5, seed=34) > 0
+    a = rand(4, 5, seed=35)
+    b = rand(4, 5, seed=36)
+    close(tp.where(cond.to("mlu"), a.to("mlu"), b.to("mlu")), tp.where(cond, a, b))
+
+
+def test_where_with_broadcasting():
+    cond = rand(4, 1, seed=37) > 0
+    a = rand(4, 5, seed=38)
+    b = rand(5, seed=39)
+    close(tp.where(cond.to("mlu"), a.to("mlu"), b.to("mlu")), tp.where(cond, a, b))
+
+
+def test_gather_backward_accumulates_duplicate_indices():
+    x = rand(4, 5, seed=40)
+    idx = indices(4, 5, high=2, seed=41)
+    xd = x.to("mlu").requires_grad_()
+    tp.gather(xd, 1, idx.to("mlu")).sum().backward()
+    xh = x.clone().requires_grad_()
+    tp.gather(xh, 1, idx).sum().backward()
+    assert xd.grad is not None
+    close(xd.grad, xh.grad)
