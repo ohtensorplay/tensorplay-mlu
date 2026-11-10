@@ -890,3 +890,90 @@ def test_batch_norm_module_training_and_eval():
         md.eval()
         close(md(x.to("mlu")), m(x))
 
+
+# -- autocast ----------------------------------------------------------------
+
+AUTOCAST_DTYPES = [tp.float16, tp.bfloat16]
+
+
+def test_autocast_is_available_on_the_device():
+    assert tp.amp.is_autocast_available("mlu")
+    assert tp.amp.is_autocast_available("cpu")
+
+
+def wide(x, fast):
+    """The host reference for an autocast call: the card rounds each operand to
+    the fast type and accumulates from there, so widening the rounded values
+    reproduces the same computation on the host."""
+    return x.to(fast).to(tp.float32)
+
+
+@pytest.mark.parametrize("fast", AUTOCAST_DTYPES)
+def test_autocast_casts_matrix_ops(fast):
+    x = rand(8, 16, seed=200)
+    w = rand(16, 32, seed=201)
+    with tp.autocast(device_type="mlu", dtype=fast):
+        y = tp.mm(x.to("mlu"), w.to("mlu"))
+    assert y.dtype == fast
+    close(y, tp.mm(wide(x, fast), wide(w, fast)), fast)
+
+    b = rand(4, 8, 16, seed=202)
+    wb = w.reshape(1, 16, 32).expand(4, 16, 32).contiguous()
+    with tp.autocast(device_type="mlu", dtype=fast):
+        yb = tp.bmm(b.to("mlu"), wb.to("mlu"))
+    assert yb.dtype == fast
+    close(yb, tp.bmm(wide(b, fast), wide(wb, fast)), fast)
+
+    bias = rand(32, seed=203)
+    wt = w.t().contiguous()
+    with tp.autocast(device_type="mlu", dtype=fast):
+        yl = tp.nn.functional.linear(x.to("mlu"), wt.to("mlu"), bias.to("mlu"))
+    assert yl.dtype == fast
+    close(yl, tp.nn.functional.linear(wide(x, fast), wide(wt, fast), bias), fast)
+
+
+@pytest.mark.parametrize("fast", AUTOCAST_DTYPES)
+def test_autocast_casts_conv2d(fast):
+    x = rand(2, 3, 8, 8, seed=210)
+    w = rand(4, 3, 3, 3, seed=211)
+    with tp.autocast(device_type="mlu", dtype=fast):
+        y = tp.nn.functional.conv2d(x.to("mlu"), w.to("mlu"))
+    assert y.dtype == fast
+    close(y, tp.nn.functional.conv2d(wide(x, fast), wide(w, fast)), fast)
+
+
+@pytest.mark.parametrize("fast", AUTOCAST_DTYPES)
+def test_autocast_keeps_fp32_ops_in_fp32(fast):
+    # The fp32 policy group runs uncast, so these keep their wide type and
+    # match the plain host result.
+    x = rand(4, 16, seed=220)
+    with tp.autocast(device_type="mlu", dtype=fast):
+        ln = tp.nn.functional.layer_norm(x.to("mlu"), [16])
+        sm = tp.nn.functional.softmax(x.to("mlu"), -1)
+    assert ln.dtype == tp.float32 and sm.dtype == tp.float32
+    close(ln, tp.nn.functional.layer_norm(x, [16]))
+    close(sm, tp.nn.functional.softmax(x, -1))
+
+
+def test_autocast_disabled_subregion_runs_wide():
+    x = rand(8, 16, seed=230)
+    w = rand(16, 32, seed=231)
+    with tp.autocast(device_type="mlu", dtype=tp.float16):
+        with tp.autocast(device_type="mlu", enabled=False):
+            y = tp.mm(x.to("mlu"), w.to("mlu"))
+    assert y.dtype == tp.float32
+    close(y, tp.mm(x, w))
+
+
+def test_autocast_module_forward():
+    tp.manual_seed(240)
+    m = tp.nn.Linear(16, 8).to("mlu")
+    x = rand(4, 16, seed=241)
+    with tp.autocast(device_type="mlu", dtype=tp.float16):
+        y = m(x.to("mlu"))
+    assert y.dtype == tp.float16
+    close(y, tp.nn.functional.linear(wide(x, tp.float16),
+                                     wide(m.weight.cpu(), tp.float16),
+                                     m.bias.cpu()), tp.float16)
+
+
