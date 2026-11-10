@@ -502,3 +502,125 @@ def test_gather_backward_accumulates_duplicate_indices():
     tp.gather(xh, 1, idx).sum().backward()
     assert xd.grad is not None
     close(xd.grad, xh.grad)
+
+
+# -- convolutions ------------------------------------------------------------
+
+CONV_DTYPES = [tp.float32, tp.float16, tp.bfloat16]
+
+
+def transpose_ref(fn, x, w, bias, *params):
+    """Host reference for a transposed convolution, accumulated in double
+    precision.  The single-precision host deconvolution picks an accelerated
+    library path whose result is not bit-stable from one call to the next; the
+    double-precision path is a plain accumulation and answers the same every
+    time, so it is the reference the device result is held to.
+    """
+    x = x.to(tp.float64)
+    w = w.to(tp.float64)
+    bias = None if bias is None else bias.to(tp.float64)
+    return fn(x, w, bias, *params)
+
+
+@pytest.mark.parametrize("dtype", CONV_DTYPES)
+@pytest.mark.parametrize("groups", (1, 2))
+def test_conv2d(dtype, groups):
+    x = rand(2, 4, 8, 8, dtype=dtype, seed=50)
+    w = rand(6, 4 // groups, 3, 3, dtype=dtype, seed=51)
+    b = rand(6, dtype=dtype, seed=52)
+    close(tp.conv2d(x.to("mlu"), w.to("mlu"), b.to("mlu"), [1, 1], [1, 1], [1, 1], groups),
+          tp.conv2d(x, w, b, [1, 1], [1, 1], [1, 1], groups), dtype)
+
+
+def test_conv2d_stride_pad_dilation():
+    x = rand(2, 3, 12, 12, seed=53)
+    w = rand(3, 3, 3, 3, seed=54)
+    for stride, pad, dil in (([2, 2], [1, 1], [1, 1]),
+                             ([1, 2], [2, 1], [1, 1]),
+                             ([1, 1], [2, 2], [2, 2]),
+                             ([2, 1], [0, 1], [1, 3])):
+        close(tp.conv2d(x.to("mlu"), w.to("mlu"), None, stride, pad, dil, 1),
+              tp.conv2d(x, w, None, stride, pad, dil, 1))
+
+
+def test_conv1d_and_conv3d():
+    x1 = rand(2, 3, 10, seed=55)
+    w1 = rand(4, 3, 3, seed=56)
+    close(tp.conv1d(x1.to("mlu"), w1.to("mlu"), None, [2], [1], [1], 1),
+          tp.conv1d(x1, w1, None, [2], [1], [1], 1))
+    x3 = rand(1, 2, 5, 5, 5, seed=57)
+    w3 = rand(3, 2, 2, 2, 2, seed=58)
+    close(tp.conv3d(x3.to("mlu"), w3.to("mlu"), None, [2, 1, 1], [1, 1, 1], [1, 1, 1], 1),
+          tp.conv3d(x3, w3, None, [2, 1, 1], [1, 1, 1], [1, 1, 1], 1))
+
+
+@pytest.mark.parametrize("dtype", CONV_DTYPES)
+def test_conv_transpose2d(dtype):
+    x = rand(2, 4, 6, 6, dtype=dtype, seed=59)
+    w = rand(4, 2, 3, 3, dtype=dtype, seed=60)
+    b = rand(2, dtype=dtype, seed=61)
+    close(tp.conv_transpose2d(x.to("mlu"), w.to("mlu"), b.to("mlu"), [2, 2], [1, 1], [1, 1], 1),
+          transpose_ref(tp.conv_transpose2d, x, w, b, [2, 2], [1, 1], [1, 1], 1), dtype)
+
+
+def test_conv_transpose_output_padding_and_groups():
+    x = rand(2, 4, 7, 7, seed=62)
+    w = rand(4, 2, 3, 3, seed=63)
+    for stride, pad, opad in (([2, 2], [1, 1], [0, 0]),
+                              ([2, 2], [1, 1], [1, 1]),
+                              ([3, 2], [2, 1], [1, 0])):
+        close(tp.conv_transpose2d(x.to("mlu"), w.to("mlu"), None, stride, pad, opad, 1),
+              transpose_ref(tp.conv_transpose2d, x, w, None, stride, pad, opad, 1))
+    xg = rand(2, 6, 5, 5, seed=64)
+    wg = rand(6, 2, 3, 3, seed=65)
+    close(tp.conv_transpose2d(xg.to("mlu"), wg.to("mlu"), None, [2, 2], [1, 1], [1, 1], 3),
+          transpose_ref(tp.conv_transpose2d, xg, wg, None, [2, 2], [1, 1], [1, 1], 3))
+
+
+def test_conv_transpose1d_and_3d():
+    x1 = rand(2, 3, 10, seed=66)
+    w1 = rand(3, 4, 3, seed=67)
+    close(tp.conv_transpose1d(x1.to("mlu"), w1.to("mlu"), None, [2], [1], [1], 1),
+          transpose_ref(tp.conv_transpose1d, x1, w1, None, [2], [1], [1], 1))
+    x3 = rand(1, 2, 4, 4, 4, seed=68)
+    w3 = rand(2, 3, 2, 2, 2, seed=69)
+    close(tp.conv_transpose3d(x3.to("mlu"), w3.to("mlu"), None, [2, 1, 1], [1, 1, 1], [1, 0, 0], 1),
+          transpose_ref(tp.conv_transpose3d, x3, w3, None, [2, 1, 1], [1, 1, 1], [1, 0, 0], 1))
+
+
+def test_conv2d_backward():
+    x = rand(2, 3, 8, 8, seed=70)
+    w = rand(5, 3, 3, 3, seed=71)
+    b = rand(5, seed=72)
+    xd = x.to("mlu").requires_grad_()
+    wd = w.to("mlu").requires_grad_()
+    bd = b.to("mlu").requires_grad_()
+    y = tp.conv2d(xd, wd, bd, [1, 1], [1, 1], [1, 1], 1)
+    (y * y).sum().backward()
+    xh = x.clone().requires_grad_()
+    wh = w.clone().requires_grad_()
+    bh = b.clone().requires_grad_()
+    yh = tp.conv2d(xh, wh, bh, [1, 1], [1, 1], [1, 1], 1)
+    (yh * yh).sum().backward()
+    close(xd.grad, xh.grad)
+    close(wd.grad, wh.grad)
+    close(bd.grad, bh.grad)
+
+
+def test_conv_transpose2d_backward():
+    x = rand(2, 4, 6, 6, seed=73)
+    w = rand(4, 2, 3, 3, seed=74)
+    b = rand(2, seed=75)
+    xd = x.to("mlu").requires_grad_()
+    wd = w.to("mlu").requires_grad_()
+    bd = b.to("mlu").requires_grad_()
+    y = tp.conv_transpose2d(xd, wd, bd, [2, 2], [1, 1], [1, 1], 1)
+    (y * y).sum().backward()
+    xh = x.to(tp.float64).requires_grad_()
+    wh = w.to(tp.float64).requires_grad_()
+    bh = b.to(tp.float64).requires_grad_()
+    yh = tp.conv_transpose2d(xh, wh, bh, [2, 2], [1, 1], [1, 1], 1)
+    (yh * yh).sum().backward()
+    close(xd.grad, xh.grad)
+    close(wd.grad, wh.grad)
+    close(bd.grad, bh.grad)
