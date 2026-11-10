@@ -33,8 +33,13 @@ Documentation = "https://github.com/lexing-2026/TensorPlay/blob/main/docs/source
 [project.entry-points."tensorplay.backends"]
 mlu = "tensorplay_mlu:_autoload"
 
+# The MagicMind graph backend becomes available by name once the MagicMind
+# SDK is installed: tensorplay.compile(model, backend="magicmind").
+[project.entry-points."tensorplay_compiler_backends"]
+magicmind = "tensorplay_mlu.compiler.backend:backend"
+
 [tool.setuptools]
-packages = ["tensorplay_mlu"]
+packages = ["tensorplay_mlu", "tensorplay_mlu.compiler"]
 
 [tool.setuptools.package-data]
 # The native sources ship with the package and are compiled against the

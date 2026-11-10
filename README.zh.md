@@ -42,13 +42,18 @@ MLU 填充该槽位：
 原生源码随 wheel 一起分发，首次加载时针对已安装的 Neuware 工具链编译，并缓存在
 `~/.cache/tensorplay_extensions` 下。
 
+同一个包还带有 **MagicMind 图后端**：`tensorplay.compile(fn, backend="magicmind")`
+将被捕获的区域经由寒武纪 MagicMind 下沉并在 MLU 上执行，详见
+[图编译（MagicMind）](#图编译magicmind)。
+
 ## 安装
 
 ### 依赖
 
 - 一块寒武纪 MLU 卡，并安装 **Neuware 工具链**（`CNToolkit`、`CNNL` 等，安装方法见
   寒武纪官方用户手册）；
-- 在同一环境中安装 TensorPlay（`pip install tensorplay`）。
+- 在同一环境中安装 TensorPlay（`pip install tensorplay`）；
+- **MagicMind** SDK，仅 `magicmind` 图后端需要。
 
 ### 环境变量
 
@@ -119,6 +124,43 @@ print(z.cpu().shape, float(loss.cpu()))
 
 其余算子通过 `cpu_fallback::register_host_fallbacks` 在主机上运行，因此
 **任何模型都能跑通**；CNNL 不支持的数据类型（整数、`float64`）同样走主机路径。
+
+## 图编译（MagicMind）
+
+`tensorplay.compile(fn, backend="magicmind")` 将被捕获的区域经由寒武纪
+**MagicMind** 下沉，并在 MLU 上执行。该区域会导出为 ONNX，解析为 MagicMind
+网络，再构建为 MLU 模型，缓存在 `~/.cache/tensorplay-magicmind` 下。缓存键覆盖
+图结构、样本形状与数据类型以及各项设置，因此只有当可能改变二进制产物的因素发生
+变化时才会重新构建。
+
+```python
+import tensorplay as tp
+import tensorplay_mlu
+
+tensorplay_mlu.load()
+
+def region(x, w, bias):
+    return tp.softmax(tp.relu(x @ w + bias), 1)
+
+f = tp.compile(region, backend="magicmind")
+x = tp.randn(8, 16, device="mlu")
+w = tp.randn(16, 32, device="mlu")
+b = tp.randn(32, device="mlu")
+print(f(x, w, b).device)          # mlu
+```
+
+选项通过 `options=` 传入（也可直接作为关键字参数）：
+
+| 选项 | 含义 |
+| --- | --- |
+| `precision` | `"fp32"`（默认）或 `"fp16"` |
+| `mlu_archs` | 构建产物针对的架构，例如 `["mtp_372"]`；不设置则由构建器决定 |
+| `cache_dir` | 序列化模型所在目录；`None` 关闭磁盘缓存 |
+| `pass_through_build_failures` | 构建失败时直接报错，而不是让该区域不编译地运行 |
+
+MagicMind 是可选依赖。未安装时该后端会被标记为不可用，在 `tensorplay.compile`
+中指名它时会提示需要安装的内容。MagicMind 无法构建的区域会退回其解释器执行，
+因此覆盖率缺口不会让整次编译失败。
 
 ## 性能
 
@@ -211,6 +253,7 @@ print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 | `tensorplay_mlu/csrc/MLUActivity.cpp` | 通过 CNPAPI 的剖析器内核级记录 |
 | `tensorplay_mlu/csrc/Module.cpp` | C 入口点：主机 fallback、内存统计 |
 | `tensorplay_mlu/csrc/NNKernels.cpp` | 神经网络内核：layer norm、dropout、embedding、NLL loss（前向/反向） |
+| `tensorplay_mlu/compiler/` | MagicMind 图后端：ONNX 下沉、内容寻址的模型缓存、MLU 执行 |
 | `tests/` | 与主机逐内核对比 |
 
 ## 版本与配套关系

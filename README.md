@@ -45,6 +45,10 @@ The native sources ship inside the wheel and are compiled against the
 installed Neuware toolkit the first time the backend is loaded, then cached
 under `~/.cache/tensorplay_extensions`.
 
+The same package ships a **MagicMind graph backend**: `tensorplay.compile(fn,
+backend="magicmind")` lowers a captured region through Cambricon MagicMind and
+runs it on the MLU — see [Graph compilation (MagicMind)](#graph-compilation-magicmind).
+
 ## Installation
 
 ### Requirements
@@ -52,6 +56,7 @@ under `~/.cache/tensorplay_extensions`.
 - a Cambricon MLU card with the **Neuware toolkit** installed
   (`CNToolkit`, `CNNL`, ... — see the Cambricon user manuals)
 - TensorPlay installed in the same environment (`pip install tensorplay`)
+- the **MagicMind** SDK, only for the `magicmind` graph backend
 
 ### Environment variables
 
@@ -124,6 +129,45 @@ The backend implements the hot paths natively on CNNL:
 Everything else runs on the host through
 `cpu_fallback::register_host_fallbacks`, so **every model runs**; data types
 CNNL does not compute in (integers, `float64`) take the host path as well.
+
+## Graph compilation (MagicMind)
+
+`tensorplay.compile(fn, backend="magicmind")` lowers a captured region
+through Cambricon **MagicMind** and runs it on the MLU.  The region is
+exported to ONNX, parsed into a MagicMind network, and built into an MLU
+model that is cached under `~/.cache/tensorplay-magicmind`.  The cache key
+covers the graph, the sample shapes and dtypes, and the settings, so a
+rebuild only happens when something that could change the binary changed.
+
+```python
+import tensorplay as tp
+import tensorplay_mlu
+
+tensorplay_mlu.load()
+
+def region(x, w, bias):
+    return tp.softmax(tp.relu(x @ w + bias), 1)
+
+f = tp.compile(region, backend="magicmind")
+x = tp.randn(8, 16, device="mlu")
+w = tp.randn(16, 32, device="mlu")
+b = tp.randn(32, device="mlu")
+print(f(x, w, b).device)          # mlu
+```
+
+Options go through `options=` (or as flat keywords):
+
+| Option | Meaning |
+| --- | --- |
+| `precision` | `"fp32"` (default) or `"fp16"` |
+| `mlu_archs` | architectures the built binary targets, for example `["mtp_372"]`; unset lets the builder choose |
+| `cache_dir` | directory for serialized models; `None` disables the disk cache |
+| `pass_through_build_failures` | raise on a build failure instead of running the region uncompiled |
+
+MagicMind is an optional dependency.  Without it the backend is reported as
+unavailable and naming it in `tensorplay.compile` explains what to install.  A
+region MagicMind cannot build stays on its interpreter, so a coverage gap
+never fails the whole compile.
 
 ## Performance
 
@@ -225,6 +269,7 @@ that still run on the host.
 | `tensorplay_mlu/csrc/MLUActivity.cpp` | profiler kernel-level records through CNPAPI |
 | `tensorplay_mlu/csrc/Module.cpp` | C entry points: host fallbacks, memory statistics |
 | `tensorplay_mlu/csrc/NNKernels.cpp` | neural-network kernels: layer norm, dropout, embedding, NLL loss (forward/backward) |
+| `tensorplay_mlu/compiler/` | MagicMind graph backend: ONNX lowering, content-addressed model cache, MLU execution |
 | `tests/` | kernel-by-kernel comparison against the host |
 
 ## Versioning and compatibility
