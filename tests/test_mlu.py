@@ -624,3 +624,153 @@ def test_conv_transpose2d_backward():
     close(xd.grad, xh.grad)
     close(wd.grad, wh.grad)
     close(bd.grad, bh.grad)
+
+
+# -- pooling -----------------------------------------------------------------
+
+POOL_DTYPES = [tp.float32, tp.float16, tp.bfloat16]
+
+
+def host_pool(fn, x, *params):
+    """Host reference for a pooling call.  The host implements pooling only for
+    the wide types, and a narrow value widens to float32 exactly, so the
+    float32 host result keeps the same values and the same winning positions.
+    """
+    return fn(x.to(tp.float32), *params)
+
+
+def same_indices(actual, expected):
+    assert actual.device.type == "mlu" and actual.dtype == tp.int64
+    assert tuple(actual.shape) == tuple(expected.shape), (actual.shape, expected.shape)
+    assert tp.equal(actual.cpu(), expected.to(tp.int64)), (actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", POOL_DTYPES)
+def test_max_pool2d_with_indices(dtype):
+    x = rand(2, 3, 7, 7, dtype=dtype, seed=80)
+    for kernel, stride, pad, dil, ceil in (([2, 2], [2, 2], [0, 0], [1, 1], False),
+                                           ([3, 3], [2, 2], [1, 1], [1, 1], False),
+                                           ([2, 3], [1, 2], [1, 1], [1, 1], False),
+                                           ([3, 3], [1, 1], [2, 2], [2, 2], False),
+                                           ([2, 2], [2, 2], [0, 0], [1, 1], True)):
+        v, i = tp.max_pool2d_with_indices(x.to("mlu"), kernel, stride, pad, dil, ceil)
+        vh, ih = host_pool(tp.max_pool2d_with_indices, x, kernel, stride, pad, dil, ceil)
+        close(v.to(tp.float32), vh, dtype)
+        same_indices(i, ih)
+
+
+@pytest.mark.parametrize("dtype", POOL_DTYPES)
+def test_avg_pool2d(dtype):
+    # The padded geometries, with the window either counted whole or trimmed
+    # to its covered part.
+    x = rand(2, 3, 8, 8, dtype=dtype, seed=81)
+    for ceil in (False, True):
+        for include_pad in (True, False):
+            close(tp.avg_pool2d(x.to("mlu"), [3, 3], [2, 2], [1, 1], ceil, include_pad),
+                  tp.avg_pool2d(x.to(tp.float32), [3, 3], [2, 2], [1, 1], ceil, include_pad),
+                  dtype)
+
+
+def test_avg_pool2d_divisor_override_runs_on_host():
+    x = rand(2, 3, 8, 8, seed=82)
+    close(tp.avg_pool2d(x.to("mlu"), [3, 3], [2, 2], [1, 1], False, True, 4),
+          tp.avg_pool2d(x, [3, 3], [2, 2], [1, 1], False, True, 4))
+
+
+@pytest.mark.parametrize("dtype", POOL_DTYPES)
+def test_max_pool3d_with_indices(dtype):
+    x = rand(2, 2, 5, 6, 7, dtype=dtype, seed=83)
+    v, i = tp.max_pool3d_with_indices(x.to("mlu"), [2, 2, 2], [2, 2, 1], [1, 1, 1], [1, 1, 1], False)
+    vh, ih = host_pool(tp.max_pool3d_with_indices, x, [2, 2, 2], [2, 2, 1], [1, 1, 1], [1, 1, 1],
+                       False)
+    close(v.to(tp.float32), vh, dtype)
+    same_indices(i, ih)
+
+
+@pytest.mark.parametrize("dtype", POOL_DTYPES)
+def test_avg_pool3d(dtype):
+    x = rand(2, 2, 5, 6, 7, dtype=dtype, seed=84)
+    for include_pad in (True, False):
+        close(tp.avg_pool3d(x.to("mlu"), [2, 2, 2], [2, 2, 1], [1, 1, 1], False, include_pad),
+              tp.avg_pool3d(x.to(tp.float32), [2, 2, 2], [2, 2, 1], [1, 1, 1], False, include_pad),
+              dtype)
+
+
+@pytest.mark.parametrize("dtype", POOL_DTYPES)
+def test_adaptive_pool2d(dtype):
+    # A mix of down- and up-scaling, including the rectangular windows whose
+    # extent changes from one output position to the next.
+    x = rand(2, 3, 7, 9, dtype=dtype, seed=85)
+    for out in ([3, 3], [1, 1], [5, 4], [1, 9], [4, 7]):
+        close(tp.adaptive_avg_pool2d(x.to("mlu"), out),
+              tp.adaptive_avg_pool2d(x.to(tp.float32), out), dtype)
+    for out in ([3, 3], [5, 4], [4, 7]):
+        v, i = tp.adaptive_max_pool2d_with_indices(x.to("mlu"), out)
+        vh, ih = host_pool(tp.adaptive_max_pool2d_with_indices, x, out)
+        close(v.to(tp.float32), vh, dtype)
+        same_indices(i, ih)
+
+
+@pytest.mark.parametrize("dtype", POOL_DTYPES)
+def test_adaptive_pool3d(dtype):
+    x = rand(2, 2, 5, 7, 9, dtype=dtype, seed=86)
+    for out in ([2, 3, 4], [1, 1, 1], [3, 4, 5]):
+        close(tp.adaptive_avg_pool3d(x.to("mlu"), out),
+              tp.adaptive_avg_pool3d(x.to(tp.float32), out), dtype)
+
+
+def test_adaptive_max_pool3d_runs_on_host():
+    # The card has no 3-D adaptive maximum; the operator still answers, from
+    # the host.
+    x = rand(2, 2, 5, 7, 9, seed=87)
+    v, i = tp.adaptive_max_pool3d(x.to("mlu"), [2, 3, 4])
+    vh, ih = tp.adaptive_max_pool3d(x, [2, 3, 4])
+    close(v, vh)
+    same_indices(i, ih)
+
+
+@pytest.mark.parametrize("dtype", POOL_DTYPES)
+def test_pool_unbatched(dtype):
+    # A 2-D pool over a 3-D operand and a 3-D pool over a 4-D one run as the
+    # batched call with a unit batch axis.
+    x2 = rand(3, 7, 7, dtype=dtype, seed=88)
+    close(tp.max_pool2d(x2.to("mlu"), [2, 2], [2, 2], [0, 0], [1, 1], False),
+          tp.max_pool2d(x2.to(tp.float32), [2, 2], [2, 2], [0, 0], [1, 1], False), dtype)
+    close(tp.avg_pool2d(x2.to("mlu"), [2, 2], [2, 2], [1, 1], False, False),
+          tp.avg_pool2d(x2.to(tp.float32), [2, 2], [2, 2], [1, 1], False, False), dtype)
+    close(tp.adaptive_avg_pool2d(x2.to("mlu"), [3, 3]),
+          tp.adaptive_avg_pool2d(x2.to(tp.float32), [3, 3]), dtype)
+    x3 = rand(3, 5, 6, 7, dtype=dtype, seed=89)
+    close(tp.max_pool3d(x3.to("mlu"), [2, 2, 2], [2, 2, 2], [0, 0, 0], [1, 1, 1], False),
+          tp.max_pool3d(x3.to(tp.float32), [2, 2, 2], [2, 2, 2], [0, 0, 0], [1, 1, 1], False), dtype)
+    close(tp.adaptive_avg_pool3d(x3.to("mlu"), [2, 2, 2]),
+          tp.adaptive_avg_pool3d(x3.to(tp.float32), [2, 2, 2]), dtype)
+
+
+def test_pool1d():
+    # The 1-D forms are expressed through the 2-D operators.
+    x = rand(3, 4, 10, seed=90)
+    close(tp.max_pool1d(x.to("mlu"), [3], [2], [1], [1], False),
+          tp.max_pool1d(x, [3], [2], [1], [1], False))
+    close(tp.avg_pool1d(x.to("mlu"), [3], [2], [1], False, True),
+          tp.avg_pool1d(x, [3], [2], [1], False, True))
+
+
+def _pool_gradient(name, x, *params, dtype=tp.float32):
+    xd = x.to("mlu").requires_grad_()
+    getattr(tp, name)(xd, *params).pow(2).sum().backward()
+    xh = x.to(tp.float32).clone().requires_grad_()
+    getattr(tp, name)(xh, *params).pow(2).sum().backward()
+    close(xd.grad, xh.grad, dtype)
+
+
+@pytest.mark.parametrize("dtype", POOL_DTYPES)
+def test_pool_backward(dtype):
+    x = rand(2, 3, 8, 8, dtype=dtype, seed=91)
+    _pool_gradient("max_pool2d", x, [2, 2], [2, 2], [0, 0], [1, 1], False, dtype=dtype)
+    _pool_gradient("avg_pool2d", x, [3, 3], [2, 2], [1, 1], False, False, dtype=dtype)
+    _pool_gradient("adaptive_max_pool2d", x, [3, 3], dtype=dtype)
+    _pool_gradient("adaptive_avg_pool2d", x, [3, 3], dtype=dtype)
+    x3 = rand(2, 2, 5, 6, 7, dtype=dtype, seed=92)
+    _pool_gradient("max_pool3d", x3, [2, 2, 2], [2, 2, 2], [0, 0, 0], [1, 1, 1], False, dtype=dtype)
+    _pool_gradient("adaptive_avg_pool3d", x3, [2, 2, 2], dtype=dtype)
