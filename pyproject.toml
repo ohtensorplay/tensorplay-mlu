@@ -33,6 +33,11 @@ Documentation = "https://github.com/lexing-2026/TensorPlay/blob/main/docs/source
 [project.entry-points."tensorplay.backends"]
 mlu = "tensorplay_mlu:_autoload"
 
+# The CNCL collective backend becomes available by name once the toolkit is
+# present: tensorplay.distributed.init_process_group("cncl").
+[project.entry-points."tensorplay.distributed.backends"]
+cncl = "tensorplay_mlu.distributed:register"
+
 # The MagicMind graph backend becomes available by name once the MagicMind
 # SDK is installed: tensorplay.compile(model, backend="magicmind").
 [project.entry-points."tensorplay_compiler_backends"]

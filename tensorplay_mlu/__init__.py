@@ -57,7 +57,7 @@ def _build(verbose: bool) -> ctypes.CDLL:
         "tensorplay_mlu",
         sorted(glob.glob(os.path.join(_CSRC, "*.cpp"))),
         extra_cflags=["-O3", "-DNDEBUG", "-Wno-deprecated-declarations"],
-        extra_ldflags=[f"-L{libdir}", "-lcnnl", "-lcnrt", f"-Wl,-rpath,{libdir}"],
+        extra_ldflags=[f"-L{libdir}", "-lcnnl", "-lcnrt", "-lcncl", f"-Wl,-rpath,{libdir}"],
         extra_include_paths=[_CSRC, os.path.join(home, "include")],
         verbose=verbose,
     )
@@ -85,6 +85,11 @@ def load(verbose: bool = False) -> None:
         from . import runtime
 
         tp._register_device_module("mlu", runtime)
+
+        # Registers the "cncl" distributed backend so MLU tensors can use it.
+        from . import distributed as _distributed
+
+        _distributed.register()
 
 
 def _autoload() -> None:
