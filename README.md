@@ -6,7 +6,7 @@
   </picture>
 </p>
 
-# tensorplay-mlu
+<h1 align="center">tensorplay-mlu</h1>
 
 **Cambricon MLU backend for [TensorPlay]** — a native, out-of-tree device
 backend that makes TensorPlay run on Cambricon MLU accelerators through the

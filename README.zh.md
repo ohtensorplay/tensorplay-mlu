@@ -6,7 +6,7 @@
   </picture>
 </p>
 
-# tensorplay-mlu
+<h1 align="center">tensorplay-mlu</h1>
 
 **TensorPlay 的寒武纪 MLU 后端** —— 一个原生的、仓库外的设备后端，通过
 CNRT 驱动与 CNNL 内核库让 TensorPlay 跑在寒武纪 MLU 加速卡上。
