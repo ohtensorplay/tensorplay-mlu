@@ -50,21 +50,6 @@ struct Geometry {
     int spatial() const { return dim - 2; }
 };
 
-// ``list`` expanded to ``n`` entries: an empty list becomes ``fallback`` and
-// a single entry broadcasts.  Nothing when the length is neither ``n`` nor 1.
-std::optional<std::vector<int>> spread(const std::vector<int64_t>& list, int n,
-                                       int64_t fallback) {
-    std::vector<int> out(static_cast<size_t>(n), static_cast<int>(fallback));
-    if (list.empty()) return out;
-    if (list.size() == 1) {
-        std::fill(out.begin(), out.end(), static_cast<int>(list[0]));
-        return out;
-    }
-    if (static_cast<int>(list.size()) != n) return std::nullopt;
-    for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)] = static_cast<int>(list[i]);
-    return out;
-}
-
 // Types the convolution kernels compute in on device ``index``.  bfloat16
 // needs a 500-series card and the 4-D form (the 5-D form requires the result
 // type itself as the compute type, which bfloat16 does not allow).
@@ -144,51 +129,7 @@ std::optional<Geometry> prepare(const Tensor& input, const Tensor& weight, int64
     return g;
 }
 
-// ========================================================= operands' order
-
-// Dimension order that shifts the channel axis last: {0,2,3,1} in 4-D,
-// {0,2,3,4,1} in 5-D.
-std::vector<int64_t> channel_last_order(int64_t nd) {
-    std::vector<int64_t> order(static_cast<size_t>(nd));
-    order[0] = 0;
-    for (int64_t i = 1; i < nd - 1; ++i) order[static_cast<size_t>(i)] = i + 1;
-    order[static_cast<size_t>(nd - 1)] = 1;
-    return order;
-}
-
-std::vector<int64_t> inverse_order(const std::vector<int64_t>& order) {
-    std::vector<int64_t> inv(order.size());
-    for (size_t i = 0; i < order.size(); ++i) {
-        inv[static_cast<size_t>(order[i])] = static_cast<int64_t>(i);
-    }
-    return inv;
-}
-
-// Channel-first sizes read in the channel-last order.
-std::vector<int64_t> to_channel_last_sizes(const std::vector<int64_t>& sizes) {
-    std::vector<int64_t> out;
-    out.reserve(sizes.size());
-    out.push_back(sizes[0]);
-    for (size_t i = 2; i < sizes.size(); ++i) out.push_back(sizes[i]);
-    out.push_back(sizes[1]);
-    return out;
-}
-
-std::vector<int64_t> channel_last_sizes(const Tensor& t) {
-    return to_channel_last_sizes(t.sizes().vec());
-}
-
-// The tensor itself when it is channel-last and dense, a channel-last copy
-// otherwise.
-Tensor channel_last(const Tensor& t) {
-    if (t.dim() < 3) return t;
-    return t.permute(channel_last_order(t.dim())).contiguous();
-}
-
-// The channel-first tensor behind a channel-last buffer.
-Tensor channel_first(const Tensor& cl) {
-    return cl.permute(inverse_order(channel_last_order(cl.dim()))).contiguous();
-}
+// ================================================================ CNNL glue
 
 // ``t`` reduced to its leading region of shape ``sizes`` (output padding can
 // make a derived shape one step too wide for the operator's own shape).
@@ -201,12 +142,6 @@ Tensor leading_region(const Tensor& t, const std::vector<int64_t>& sizes) {
         }
     }
     return out.contiguous();
-}
-
-// ================================================================ CNNL glue
-
-cnnlTensorLayout_t channel_layout(int dim) {
-    return dim == 4 ? CNNL_LAYOUT_NHWC : CNNL_LAYOUT_NDHWC;
 }
 
 // Owning convolution descriptor.
@@ -535,31 +470,6 @@ std::optional<Tensor> grad_bias_core(const Tensor& grad_output, int64_t channels
 }
 
 // ================================================================== entries
-
-// A 1-D convolution runs as the 2-D one with a unit third axis: this adds
-// that axis to the tensors and to each spatial parameter, and drops it from
-// the result.
-class UnitAxis {
-public:
-    explicit UnitAxis(bool active) : active_(active) {}
-
-    Tensor lift(const Tensor& t) const { return active_ ? t.unsqueeze(2) : t; }
-
-    // A spatial parameter list gains one leading entry, the value that axis
-    // does not change: 1 for a stride or a dilation, 0 for a padding or an
-    // output padding.
-    std::vector<int64_t> lift(const std::vector<int64_t>& v, int64_t fill) const {
-        if (!active_) return v;
-        std::vector<int64_t> out = v;
-        out.insert(out.begin(), fill);
-        return out;
-    }
-
-    Tensor lower(const Tensor& t) const { return active_ ? t.squeeze(2) : t; }
-
-private:
-    bool active_;
-};
 
 std::optional<Tensor> forward_entry(const Tensor& input, const Tensor& weight, const Tensor* bias,
                                     const std::vector<int64_t>& stride,

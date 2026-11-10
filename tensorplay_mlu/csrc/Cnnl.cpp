@@ -221,5 +221,60 @@ Tensor contiguous_on_device(const Tensor& t) {
     return out;
 }
 
+std::vector<int64_t> channel_last_order(int64_t nd) {
+    std::vector<int64_t> order(static_cast<size_t>(nd));
+    order[0] = 0;
+    for (int64_t i = 1; i < nd - 1; ++i) order[static_cast<size_t>(i)] = i + 1;
+    order[static_cast<size_t>(nd - 1)] = 1;
+    return order;
+}
+
+std::vector<int64_t> inverse_order(const std::vector<int64_t>& order) {
+    std::vector<int64_t> inv(order.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        inv[static_cast<size_t>(order[i])] = static_cast<int64_t>(i);
+    }
+    return inv;
+}
+
+std::vector<int64_t> to_channel_last_sizes(const std::vector<int64_t>& sizes) {
+    std::vector<int64_t> out;
+    out.reserve(sizes.size());
+    out.push_back(sizes[0]);
+    for (size_t i = 2; i < sizes.size(); ++i) out.push_back(sizes[i]);
+    out.push_back(sizes[1]);
+    return out;
+}
+
+std::vector<int64_t> channel_last_sizes(const Tensor& t) {
+    return to_channel_last_sizes(t.sizes().vec());
+}
+
+Tensor channel_last(const Tensor& t) {
+    if (t.dim() < 3) return t;
+    return t.permute(channel_last_order(t.dim())).contiguous();
+}
+
+Tensor channel_first(const Tensor& cl) {
+    return cl.permute(inverse_order(channel_last_order(cl.dim()))).contiguous();
+}
+
+cnnlTensorLayout_t channel_layout(int dim) {
+    return dim == 4 ? CNNL_LAYOUT_NHWC : CNNL_LAYOUT_NDHWC;
+}
+
+std::optional<std::vector<int>> spread(const std::vector<int64_t>& list, int n,
+                                       int64_t fallback) {
+    std::vector<int> out(static_cast<size_t>(n), static_cast<int>(fallback));
+    if (list.empty()) return out;
+    if (list.size() == 1) {
+        std::fill(out.begin(), out.end(), static_cast<int>(list[0]));
+        return out;
+    }
+    if (static_cast<int>(list.size()) != n) return std::nullopt;
+    for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)] = static_cast<int>(list[i]);
+    return out;
+}
+
 } // namespace mlu
 } // namespace tensorplay

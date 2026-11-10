@@ -94,5 +94,58 @@ TensorDesc padded_desc(const Tensor& t, size_t ndim);
 // of its dimensions (contiguous, or a permutation of contiguous).
 bool is_dense(const Tensor& t);
 
+// ------------------------------- channel-last operands ---------------------
+
+// Dimension order that shifts the channel axis last: {0,2,3,1} in 4-D,
+// {0,2,3,4,1} in 5-D.
+std::vector<int64_t> channel_last_order(int64_t nd);
+
+// The permutation that undoes ``order``.
+std::vector<int64_t> inverse_order(const std::vector<int64_t>& order);
+
+// Channel-first sizes read in the channel-last order.
+std::vector<int64_t> to_channel_last_sizes(const std::vector<int64_t>& sizes);
+
+std::vector<int64_t> channel_last_sizes(const Tensor& t);
+
+// The tensor itself when it is channel-last and dense, a channel-last copy
+// otherwise.
+Tensor channel_last(const Tensor& t);
+
+// The channel-first tensor behind a channel-last buffer.
+Tensor channel_first(const Tensor& cl);
+
+// CNNL's named order for a 4-D or 5-D channel-last tensor.
+cnnlTensorLayout_t channel_layout(int dim);
+
+// ``list`` expanded to ``n`` entries: an empty list becomes ``fallback`` and
+// a single entry broadcasts.  Nothing when the length is neither ``n`` nor 1.
+std::optional<std::vector<int>> spread(const std::vector<int64_t>& list, int n, int64_t fallback);
+
+// A 1-D operator runs as the 2-D one with a unit third axis: this adds that
+// axis to the tensors and to each spatial parameter, and drops it from the
+// result.
+class UnitAxis {
+public:
+    explicit UnitAxis(bool active) : active_(active) {}
+
+    Tensor lift(const Tensor& t) const { return active_ ? t.unsqueeze(2) : t; }
+
+    // A spatial parameter list gains one leading entry, the value that axis
+    // does not change: 1 for a stride or a dilation, 0 for a padding or an
+    // output padding.
+    std::vector<int64_t> lift(const std::vector<int64_t>& v, int64_t fill) const {
+        if (!active_) return v;
+        std::vector<int64_t> out = v;
+        out.insert(out.begin(), fill);
+        return out;
+    }
+
+    Tensor lower(const Tensor& t) const { return active_ ? t.squeeze(2) : t; }
+
+private:
+    bool active_;
+};
+
 } // namespace mlu
 } // namespace tensorplay
