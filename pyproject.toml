@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensorplay-mlu"
+version = "0.1.0"
+description = "Cambricon MLU device backend for TensorPlay"
+requires-python = ">=3.10"
+dependencies = ["tensorplay"]
+readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/ohtensorplay/tensorplay-mlu"
+Repository = "https://github.com/ohtensorplay/tensorplay-mlu"
+TensorPlay = "https://github.com/lexing-2026/TensorPlay"
+
+# `import tensorplay` loads the backend when the Neuware toolkit is present.
+[project.entry-points."tensorplay.backends"]
+mlu = "tensorplay_mlu:_autoload"
+
+[tool.setuptools]
+packages = ["tensorplay_mlu"]
+
+[tool.setuptools.package-data]
+# The native sources ship with the package and are compiled against the
+# installed toolkit on first load.
+tensorplay_mlu = ["csrc/*.cpp", "csrc/*.h"]
