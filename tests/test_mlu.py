@@ -774,3 +774,119 @@ def test_pool_backward(dtype):
     x3 = rand(2, 2, 5, 6, 7, dtype=dtype, seed=92)
     _pool_gradient("max_pool3d", x3, [2, 2, 2], [2, 2, 2], [0, 0, 0], [1, 1, 1], False, dtype=dtype)
     _pool_gradient("adaptive_avg_pool3d", x3, [2, 2, 2], dtype=dtype)
+
+
+# -- batch normalization -----------------------------------------------------
+
+BN_DTYPES = [tp.float32, tp.float16, tp.bfloat16]
+BN_SHAPES = [(8, 4), (3, 5, 7), (2, 3, 4, 5), (2, 3, 4, 4, 3)]
+
+
+def mlu(t):
+    return None if t is None else t.to("mlu")
+
+
+def bn_params(shape, dtype, affine, seed):
+    """A batch-normalization sample: the input, the optional affine pair and the
+    running statistics, all in ``dtype``."""
+    c = shape[1]
+    x = rand(*shape, dtype=dtype, seed=seed)
+    w = rand(c, dtype=dtype, seed=seed + 1) if affine else None
+    b = rand(c, dtype=dtype, seed=seed + 2) if affine else None
+    rm = rand(c, dtype=dtype, seed=seed + 3).abs()
+    rv = rand(c, dtype=dtype, seed=seed + 4).abs() + 0.5
+    return x, w, b, rm, rv
+
+
+@pytest.mark.parametrize("dtype", BN_DTYPES)
+@pytest.mark.parametrize("shape", BN_SHAPES)
+@pytest.mark.parametrize("affine", (True, False))
+def test_batch_norm_training(shape, affine, dtype):
+    # A training pass normalizes by the batch statistics and folds those into
+    # the running statistics with the momentum.
+    x, w, b, rm, rv = bn_params(shape, dtype, affine, seed=100)
+    rmm, rvm = rm.to("mlu"), rv.to("mlu")
+    y = tp.nn.functional.batch_norm(mlu(x), rmm, rvm, mlu(w), mlu(b), True, 0.1, 1e-5)
+    yh = tp.nn.functional.batch_norm(x, rm, rv, w, b, True, 0.1, 1e-5)
+    close(y, yh, dtype)
+    close(rmm, rm, dtype)
+    close(rvm, rv, dtype)
+
+
+@pytest.mark.parametrize("dtype", BN_DTYPES)
+@pytest.mark.parametrize("shape", BN_SHAPES)
+def test_batch_norm_eval(shape, dtype):
+    # An inference pass normalizes by the running statistics and leaves them
+    # untouched.
+    x, w, b, rm, rv = bn_params(shape, dtype, True, seed=110)
+    rmm, rvm = rm.to("mlu"), rv.to("mlu")
+    y = tp.nn.functional.batch_norm(mlu(x), rmm, rvm, mlu(w), mlu(b), False, 0.1, 1e-5)
+    yh = tp.nn.functional.batch_norm(x, rm, rv, w, b, False, 0.1, 1e-5)
+    close(y, yh, dtype)
+    assert tp.equal(rmm.cpu(), rm) and tp.equal(rvm.cpu(), rv)
+
+
+@pytest.mark.parametrize("dtype", BN_DTYPES)
+def test_native_batch_norm_saves_statistics(dtype):
+    # The native form also reports the batch statistics it normalized by.
+    x, w, b, rm, rv = bn_params((2, 3, 4, 5), dtype, True, seed=120)
+    rmm, rvm = rm.to("mlu"), rv.to("mlu")
+    om, sm, si = tp.native_batch_norm(mlu(x), mlu(w), mlu(b), rmm, rvm, True, 0.1, 1e-5)
+    oh, sh, sih = tp.native_batch_norm(x, w, b, rm, rv, True, 0.1, 1e-5)
+    close(om, oh, dtype)
+    close(sm, sh, dtype)
+    close(si, sih, dtype)
+    close(rmm, rm, dtype)
+    close(rvm, rv, dtype)
+
+
+def test_native_batch_norm_eval_returns_empty_statistics():
+    x, w, b, rm, rv = bn_params((2, 3, 4, 5), tp.float32, True, seed=130)
+    om, sm, si = tp.native_batch_norm(mlu(x), mlu(w), mlu(b), mlu(rm), mlu(rv), False, 0.1, 1e-5)
+    oh, sh, sih = tp.native_batch_norm(x, w, b, rm, rv, False, 0.1, 1e-5)
+    close(om, oh)
+    assert sm.numel() == 0 and si.numel() == 0
+    assert sh.numel() == 0 and sih.numel() == 0
+
+
+@pytest.mark.parametrize("dtype", BN_DTYPES)
+@pytest.mark.parametrize("training", (True, False))
+def test_batch_norm_backward(training, dtype):
+    # A training backward takes its statistics from a fresh training forward;
+    # an inference backward uses the running statistics.
+    x, w, b, rm, rv = bn_params((2, 3, 4, 5), dtype, True, seed=140)
+    xm = x.to("mlu").requires_grad_()
+    wm = w.to("mlu").requires_grad_()
+    bm = b.to("mlu").requires_grad_()
+    (tp.nn.functional.batch_norm(xm, mlu(rm), mlu(rv), wm, bm, training, 0.1,
+                                 1e-5) ** 2).sum().backward()
+    xh = x.to(tp.float32).requires_grad_()
+    wh = w.to(tp.float32).requires_grad_()
+    bh = b.to(tp.float32).requires_grad_()
+    (tp.nn.functional.batch_norm(xh, rm.to(tp.float32).clone(), rv.to(tp.float32).clone(), wh, bh,
+                                 training, 0.1, 1e-5) ** 2).sum().backward()
+    close(xm.grad, xh.grad, dtype)
+    close(wm.grad, wh.grad, dtype)
+    close(bm.grad, bh.grad, dtype)
+
+
+def test_batch_norm_module_training_and_eval():
+    # The module drives the same operator end to end, over every rank it
+    # accepts.
+    for cls, shape in ((tp.nn.BatchNorm1d, (8, 4)), (tp.nn.BatchNorm1d, (3, 5, 7)),
+                       (tp.nn.BatchNorm2d, (2, 3, 4, 5)), (tp.nn.BatchNorm3d, (2, 3, 3, 4, 4))):
+        tp.manual_seed(150)
+        m = cls(shape[1])
+        md = cls(shape[1])
+        md.load_state_dict(m.state_dict())
+        md = md.to("mlu")
+        x = rand(*shape, seed=151)
+        m.train()
+        md.train()
+        close(md(x.to("mlu")), m(x))
+        close(md.running_mean, m.running_mean)
+        close(md.running_var, m.running_var)
+        m.eval()
+        md.eval()
+        close(md(x.to("mlu")), m(x))
+
