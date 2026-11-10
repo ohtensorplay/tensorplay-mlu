@@ -123,6 +123,23 @@ def test_all_to_all_single():
         assert recv.tolist() == [1.0, 2.0, 3.0, 4.0]
 
 
+def test_all_to_all_single_with_splits():
+    with _single_rank() as dist:
+        send = _mlu_tensor([[1.0, 2.0], [3.0, 4.0]])
+        recv = _mlu_tensor([[0.0, 0.0], [0.0, 0.0]])
+        dist.all_to_all_single(recv, send, output_split_sizes=[2],
+                               input_split_sizes=[2])
+        assert recv.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+
+
+def test_all_to_all_list():
+    with _single_rank() as dist:
+        sends = [_mlu_tensor([1.0, 2.0])]
+        recvs = [_mlu_tensor([0.0, 0.0])]
+        dist.all_to_all(recvs, sends)
+        assert recvs[0].tolist() == [1.0, 2.0]
+
+
 def test_barrier_and_send_recv_self():
     with _single_rank() as dist:
         t = _mlu_tensor([1.0])

@@ -32,8 +32,8 @@ __all__ = ["is_available"]
 # Native entry points
 # ---------------------------------------------------------------------------
 # Element-type codes and reduction codes share the convention of
-# ``csrc/Cncl.cpp``; keeping them here avoids mirroring the CNCL enums in two
-# places.
+# ``csrc/Cncl.cpp``; keeping them here avoids spelling the CNCL enums out in
+# two places.
 _DTYPE_CODES = {
     "uint8": 0,
     "int8": 1,
@@ -479,52 +479,80 @@ class _CnclProcessGroup:
         self.ensure()
         lib = _bindings()
         dtype = _dtype_code(input_tensor)
+        rank = self._pg.rank()
         world = self._pg.size()
-        if not output_split_sizes and not input_split_sizes:
-            count = int(input_tensor.numel()) // world
-            if count:
-                _check(lib.tp_mlu_cncl_all_to_all(
-                    _handle(input_tensor), _handle(output), count, dtype,
-                    self._device, self._comm))
-            return self._work()
-        # An absent split list means the buffer is divided evenly.
-        in_sizes = list(input_split_sizes) or [int(input_tensor.numel()) // world] * world
-        out_sizes = list(output_split_sizes) or [int(output.numel()) // world] * world
-        in_offsets = _prefix_offsets(in_sizes)
-        out_offsets = _prefix_offsets(out_sizes)
         flat_in = _flat(input_tensor)
-        _check(lib.tp_mlu_cncl_group_start())
-        for peer in range(world):
-            if in_sizes[peer]:
-                _check(lib.tp_mlu_cncl_send(
-                    _handle(flat_in.narrow(0, in_offsets[peer], in_sizes[peer])),
-                    in_sizes[peer], dtype, peer, self._device, self._comm))
-        for peer in range(world):
-            if out_sizes[peer]:
-                _check(lib.tp_mlu_cncl_recv(
-                    _handle(output.narrow(0, out_offsets[peer], out_sizes[peer])),
-                    out_sizes[peer], dtype, peer, self._device, self._comm))
-        _check(lib.tp_mlu_cncl_group_end())
+        flat_out = _flat(output)
+
+        if not output_split_sizes and not input_split_sizes:
+            if world == 1:
+                flat_out.copy_(flat_in)
+            elif flat_in.numel():
+                _check(lib.tp_mlu_cncl_all_to_all(
+                    _handle(flat_in), _handle(flat_out),
+                    int(flat_in.numel()) // world, dtype, self._device,
+                    self._comm))
+            self._write_back(output, flat_out)
+            return self._work()
+
+        # The split sizes count leading-dimension rows; convert to elements
+        # so the exchange works for tensors of any rank.
+        in_counts = _element_counts(input_tensor, input_split_sizes, world)
+        out_counts = _element_counts(output, output_split_sizes, world)
+        in_offsets = _prefix_offsets(in_counts)
+        out_offsets = _prefix_offsets(out_counts)
+
+        if world > 1:
+            _check(lib.tp_mlu_cncl_group_start())
+            for peer in range(world):
+                if peer != rank and in_counts[peer]:
+                    _check(lib.tp_mlu_cncl_send(
+                        _handle(flat_in.narrow(0, in_offsets[peer], in_counts[peer])),
+                        in_counts[peer], dtype, peer, self._device, self._comm))
+            for peer in range(world):
+                if peer != rank and out_counts[peer]:
+                    _check(lib.tp_mlu_cncl_recv(
+                        _handle(flat_out.narrow(0, out_offsets[peer], out_counts[peer])),
+                        out_counts[peer], dtype, peer, self._device, self._comm))
+            _check(lib.tp_mlu_cncl_group_end())
+        # The self exchange never leaves the device.
+        if in_counts[rank] and out_counts[rank]:
+            flat_out.narrow(0, out_offsets[rank], out_counts[rank]).copy_(
+                flat_in.narrow(0, in_offsets[rank], in_counts[rank]))
+        self._write_back(output, flat_out)
         return self._work()
 
     def alltoall(self, outputs: List[Any], inputs: List[Any], timeout_ms: int):
         self.ensure()
         lib = _bindings()
+        rank = self._pg.rank()
+        world = self._pg.size()
+        if world == 1:
+            if inputs[0].numel():
+                outputs[0].copy_(_flat(inputs[0]))
+            return self._work()
         _check(lib.tp_mlu_cncl_group_start())
         for peer, tensor in enumerate(inputs):
             count = int(tensor.numel())
-            if count:
+            if count and peer != rank:
                 _check(lib.tp_mlu_cncl_send(_handle(tensor), count,
                                             _dtype_code(tensor), peer,
                                             self._device, self._comm))
         for peer, tensor in enumerate(outputs):
             count = int(tensor.numel())
-            if count:
+            if count and peer != rank:
                 _check(lib.tp_mlu_cncl_recv(_handle(tensor), count,
                                             _dtype_code(tensor), peer,
                                             self._device, self._comm))
         _check(lib.tp_mlu_cncl_group_end())
+        if inputs[rank].numel() and outputs[rank].numel():
+            outputs[rank].copy_(_flat(inputs[rank]))
         return self._work()
+
+    def _write_back(self, output, flat_out) -> None:
+        """Undo a flattening copy when ``_flat`` had to allocate one."""
+        if flat_out.data_ptr() != output.data_ptr() or not output.is_contiguous():
+            output.copy_(flat_out.reshape(output.shape))
 
     # -- point to point ----------------------------------------------------
     def send(self, tensors: List[Any], dst: int, tag: int):
@@ -571,6 +599,20 @@ def _prefix_offsets(sizes):
         offsets.append(total)
         total += int(size)
     return offsets
+
+
+def _element_counts(tensor, split_sizes, world: int):
+    """Per-peer element counts for ``all_to_all`` split sizes.
+
+    ``split_sizes`` counts leading-dimension rows, as the frontend passes
+    them; the exchange itself works in elements, so scale by the row size.
+    An absent list means the buffer is divided evenly between the peers.
+    """
+    dim0 = int(tensor.shape[0]) if tensor.dim() > 0 else 1
+    row = int(tensor.numel()) // dim0 if dim0 else 0
+    if split_sizes:
+        return [int(size) * row for size in split_sizes]
+    return [(dim0 // world) * row] * world
 
 
 def is_available() -> bool:
