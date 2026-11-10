@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/cambricon-lockup-white.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/cambricon-lockup.png">
+    <img src="docs/images/cambricon-lockup.png" alt="Cambricon" width="420">
+  </picture>
+</p>
+
 # tensorplay-mlu
 
 **Cambricon MLU backend for [TensorPlay]** — a native, out-of-tree device
@@ -201,6 +209,10 @@ the TensorPlay repository.
 ## License
 
 [Apache License 2.0](LICENSE).
+
+*Cambricon and the Cambricon logo are trademarks of Cambricon Technologies
+Corporation Limited.  This project is not affiliated with or endorsed by
+Cambricon.*
 
 [TensorPlay]: https://github.com/lexing-2026/TensorPlay
 [Adding a device backend]: https://github.com/lexing-2026/TensorPlay/blob/main/docs/source/notes/backends.md
