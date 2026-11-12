@@ -223,6 +223,14 @@ IndexWindows adaptive_windows(const std::vector<int64_t>& in_dim,
 // buffers of the pooled shape ``out_sizes``; with ``to_plane`` set, ``src``
 // is channel last (the card's layout) and ``dst`` channel first, and the
 // other way round otherwise.
+//
+// What an entry becomes depends on the entry and on the output coordinate it
+// sits at, and on nothing else.  So the part that depends on the coordinate is
+// worked out once per coordinate, a cheap table turns an entry into its
+// contribution, and the entries are then walked in the order the source stores
+// them.  Decoding and re-encoding every entry on its own costs a pair of
+// divisions and a pair of multiplications per element, which for a pooled
+// operand of any size is what the call spends its time on.
 void translate_indices(const Tensor& src, const Tensor& dst, const IndexWindows& w,
                        const std::vector<int64_t>& in_dim, const std::vector<int64_t>& out_sizes,
                        bool to_plane) {
@@ -240,59 +248,122 @@ void translate_indices(const Tensor& src, const Tensor& dst, const IndexWindows&
     int64_t count = 1;
     for (int i = 0; i < sp; ++i) count *= out_dim[static_cast<size_t>(i)];
 
-    std::vector<int64_t> coord(static_cast<size_t>(sp));
-    std::vector<int64_t> part(static_cast<size_t>(sp));
     std::vector<int64_t> out(raw.size());
-    for (int64_t n = 0; n < n_batch; ++n) {
-        for (int64_t c = 0; c < channels; ++c) {
-            const int64_t plane_base = (n * channels + c) * count;
-            for (int64_t linear = 0; linear < count; ++linear) {
-                int64_t rem = linear;
+    std::vector<int64_t> coord(static_cast<size_t>(sp));
+
+    // The spatial coordinate of an output entry, decoded from its offset in
+    // the pooled plane.
+    const auto decode = [&](int64_t linear) {
+        for (int i = sp - 1; i >= 0; --i) {
+            const size_t u = static_cast<size_t>(i);
+            coord[u] = linear % out_dim[u];
+            linear /= out_dim[u];
+        }
+    };
+
+    if (to_plane) {
+        // An entry names one covered coordinate inside the window, so the
+        // plane offset it stands for is settled once the output coordinate is
+        // known.  The entries a window can report are the window's own extent,
+        // so the whole mapping is a short run per output coordinate.
+        std::vector<int64_t> run(static_cast<size_t>(count));
+        std::vector<int64_t> at(static_cast<size_t>(count));
+        int64_t entries = 0;
+        for (int64_t s = 0; s < count; ++s) {
+            decode(s);
+            int64_t span = 1;
+            for (int i = 0; i < sp; ++i) {
+                const size_t u = static_cast<size_t>(i);
+                span *= w.extent[u][static_cast<size_t>(coord[u])];
+            }
+            run[static_cast<size_t>(s)] = span;
+            at[static_cast<size_t>(s)] = entries;
+            entries += span;
+        }
+        std::vector<int64_t> plane(static_cast<size_t>(entries));
+        for (int64_t s = 0; s < count; ++s) {
+            decode(s);
+            int64_t width = 1;
+            int64_t base = 0;
+            for (int i = sp - 1; i >= 0; --i) {
+                const size_t u = static_cast<size_t>(i);
+                base += w.origin[u][static_cast<size_t>(coord[u])] * width;
+                width *= in_dim[u];
+            }
+            const int64_t span = run[static_cast<size_t>(s)];
+            for (int64_t r = 0; r < span; ++r) {
+                int64_t krem = r;
+                int64_t value = base;
+                int64_t span_width = 1;
                 for (int i = sp - 1; i >= 0; --i) {
                     const size_t u = static_cast<size_t>(i);
-                    coord[u] = rem % out_dim[u];
-                    rem /= out_dim[u];
+                    const int64_t extent = w.extent[u][static_cast<size_t>(coord[u])];
+                    const int64_t p = krem % extent;
+                    krem /= extent;
+                    value += p * w.step[u] * span_width;
+                    span_width *= in_dim[u];
                 }
-                int64_t window_off = 0;
-                for (int i = 0; i < sp; ++i) {
-                    window_off = window_off * out_dim[static_cast<size_t>(i)] +
-                                 coord[static_cast<size_t>(i)];
-                }
-                // Channel-last row-major offset over the whole batch: the
-                // batch's own block of windows precedes the spatial part.
-                window_off = (n * count + window_off) * channels + c;
-                const size_t src_at =
-                    static_cast<size_t>(to_plane ? window_off : plane_base + linear);
+                plane[static_cast<size_t>(at[static_cast<size_t>(s)] + r)] = value;
+            }
+        }
 
-                int64_t value = 0;
-                if (to_plane) {
-                    int64_t krem = raw[src_at];
-                    for (int i = sp - 1; i >= 0; --i) {
-                        const size_t u = static_cast<size_t>(i);
-                        const int64_t ext = w.extent[u][static_cast<size_t>(coord[u])];
-                        part[u] = krem % ext;
-                        krem /= ext;
-                    }
-                    for (int i = 0; i < sp; ++i) {
-                        const size_t u = static_cast<size_t>(i);
-                        value = value * in_dim[u] + w.origin[u][static_cast<size_t>(coord[u])] +
-                                part[u] * w.step[u];
-                    }
-                } else {
-                    int64_t prem = raw[src_at];
-                    for (int i = sp - 1; i >= 0; --i) {
-                        const size_t u = static_cast<size_t>(i);
-                        part[u] = prem % in_dim[u];
-                        prem /= in_dim[u];
-                    }
-                    for (int i = 0; i < sp; ++i) {
-                        const size_t u = static_cast<size_t>(i);
-                        const int64_t rel =
-                            (part[u] - w.origin[u][static_cast<size_t>(coord[u])]) / w.step[u];
-                        value = value * w.extent[u][static_cast<size_t>(coord[u])] + rel;
-                    }
+        for (int64_t n = 0; n < n_batch; ++n) {
+            const int64_t last_base = n * count * channels;
+            const int64_t first_base = n * channels * count;
+            for (int64_t s = 0; s < count; ++s) {
+                const int64_t* row = plane.data() + at[static_cast<size_t>(s)];
+                const int64_t span = run[static_cast<size_t>(s)];
+                const int64_t* from = raw.data() + last_base + s * channels;
+                int64_t* to = out.data() + first_base + s;
+                for (int64_t c = 0; c < channels; ++c) {
+                    int64_t r = from[c];
+                    if (r < 0 || r >= span) r = 0;
+                    to[c * count] = row[r];
                 }
-                out[static_cast<size_t>(to_plane ? plane_base + linear : window_off)] = value;
+            }
+        }
+    } else {
+        // A plane offset decodes into a covered coordinate; where that
+        // coordinate sits inside the window depends on the axis coordinate and
+        // the output coordinate alone, so it is tabulated per axis.
+        std::vector<std::vector<int64_t>> where(static_cast<size_t>(sp));
+        for (int i = 0; i < sp; ++i) {
+            const size_t u = static_cast<size_t>(i);
+            where[u].assign(static_cast<size_t>(in_dim[u] * out_dim[u]), 0);
+            for (int64_t o = 0; o < out_dim[u]; ++o) {
+                const int64_t origin = w.origin[u][static_cast<size_t>(o)];
+                const int64_t step = w.step[u];
+                const int64_t extent = w.extent[u][static_cast<size_t>(o)];
+                for (int64_t p = 0; p < in_dim[u]; ++p) {
+                    const int64_t d = p - origin;
+                    int64_t r = (d % step == 0) ? d / step : 0;
+                    if (r < 0 || r >= extent) r = 0;
+                    where[u][static_cast<size_t>(p * out_dim[u] + o)] = r;
+                }
+            }
+        }
+
+        for (int64_t n = 0; n < n_batch; ++n) {
+            const int64_t last_base = n * count * channels;
+            const int64_t first_base = n * channels * count;
+            for (int64_t s = 0; s < count; ++s) {
+                decode(s);
+                const int64_t* from = raw.data() + first_base + s;
+                int64_t* to = out.data() + last_base + s * channels;
+                for (int64_t c = 0; c < channels; ++c) {
+                    int64_t prem = from[c * count];
+                    int64_t value = 0;
+                    int64_t span_width = 1;
+                    for (int i = sp - 1; i >= 0; --i) {
+                        const size_t u = static_cast<size_t>(i);
+                        const int64_t p = prem % in_dim[u];
+                        prem /= in_dim[u];
+                        value += where[u][static_cast<size_t>(p * out_dim[u] + coord[u])] *
+                                 span_width;
+                        span_width *= w.extent[u][static_cast<size_t>(coord[u])];
+                    }
+                    to[c] = value;
+                }
             }
         }
     }
@@ -401,6 +472,53 @@ std::optional<Tensor> avg_pool_core(const Tensor& input, const PoolGeometry& g,
     return channel_first(y);
 }
 
+// y = maximum pooling of ``x``, carrying no winning positions.  The form that
+// reports nothing is not accepted for every geometry, so the status of each
+// call is read rather than thrown: a geometry the card turns down is reported
+// as a decline and the caller picks a form that is accepted.
+bool launch_max_values_forward(const Tensor& x, const PoolGeometry& g, const Tensor& y) {
+    const int index = index_of(x.device());
+    DeviceGuard guard(index);
+    cnnlHandle_t h = handle(index);
+    TensorDesc x_desc(x.sizes().vec(), channel_layout(g.dim), x.dtype());
+    TensorDesc y_desc(y.sizes().vec(), channel_layout(g.dim), y.dtype());
+
+    PoolOpDesc desc;
+    if (!desc.build(g, CNNL_POOLING_MAX)) return false;
+
+    size_t ws_size = 0;
+    if (cnnlGetPoolingWorkspaceSize_v2(h, desc.get(), x_desc, y_desc, &ws_size) !=
+        CNNL_STATUS_SUCCESS) {
+        return false;
+    }
+    Workspace ws(ws_size, index);
+    if (cnnlPoolingForward_v2(h, desc.get(), nullptr, x_desc, x.data_ptr(), nullptr, nullptr,
+                              y_desc, y.data_ptr(), ws_size == 0 ? nullptr : ws.get(),
+                              ws_size) != CNNL_STATUS_SUCCESS) {
+        return false;
+    }
+    return true;
+}
+
+// y = maximum pooling of ``x``, values only.  Asking the card for the winning
+// positions makes it emit a second operand of one entry per pooled element and
+// costs a fixed amount of bookkeeping per call; a caller that only wants the
+// values should not pay for that, so the positions are requested only when the
+// values-only form turns the geometry down.
+std::optional<Tensor> max_pool_values_core(const Tensor& input, const PoolGeometry& g) {
+    auto sizes = pooled_sizes(input, g);
+    if (!sizes) return std::nullopt;
+    const int index = index_of(input.device());
+    Tensor y = empty_on(to_channel_last_sizes(*sizes), input.dtype(), index);
+    if (y.numel() > 0) {
+        if (!launch_max_values_forward(channel_last(input), g, y)) {
+            Tensor raw_cl = empty_on(to_channel_last_sizes(*sizes), DType::Int64, index);
+            if (!launch_max_forward(channel_last(input), g, y, raw_cl)) return std::nullopt;
+        }
+    }
+    return channel_first(y);
+}
+
 // ================================================================ backward
 
 // diff_x = gradient of a sliding-window pooling of ``x``.  ``idx`` is the
@@ -423,13 +541,20 @@ bool launch_pool_backward(const Tensor& x, const Tensor& diff_y, const Tensor* i
 
     const void* i_ptr = idx != nullptr ? idx->data_ptr() : nullptr;
     size_t ws_size = 0;
-    TP_CNNL_TRY(cnnlGetPoolingBackwardWorkspaceSize(h, desc.get(), i_desc, dy_desc, x_desc,
-                                                    dx_desc, &ws_size));
+    // A geometry the card does not accept is reported as a decline, so the
+    // operator runs on the host rather than failing the call: the sliding
+    // descriptors the caller can build are wider than the set the card
+    // implements, and a dilated window is one such case.
+    if (cnnlGetPoolingBackwardWorkspaceSize(h, desc.get(), i_desc, dy_desc, x_desc, dx_desc,
+                                            &ws_size) != CNNL_STATUS_SUCCESS) {
+        return false;
+    }
     Workspace ws(ws_size, index);
-    TP_CNNL_TRY(cnnlPoolingBackward_v2(h, desc.get(), nullptr, i_desc, i_ptr, dy_desc,
-                                       diff_y.data_ptr(), x_desc, x.data_ptr(), nullptr, dx_desc,
-                                       diff_x.data_ptr(), ws_size == 0 ? nullptr : ws.get(),
-                                       ws_size));
+    if (cnnlPoolingBackward_v2(h, desc.get(), nullptr, i_desc, i_ptr, dy_desc, diff_y.data_ptr(),
+                               x_desc, x.data_ptr(), nullptr, dx_desc, diff_x.data_ptr(),
+                               ws_size == 0 ? nullptr : ws.get(), ws_size) != CNNL_STATUS_SUCCESS) {
+        return false;
+    }
     return true;
 }
 
@@ -462,6 +587,38 @@ std::optional<Tensor> pool_backward_core(const Tensor& grad_output, const Tensor
                                  : CNNL_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING);
         if (!launch_pool_backward(channel_last(input), channel_last(grad_output),
                                   indices != nullptr ? &idx_cl : nullptr, g, mode, dx)) {
+            return std::nullopt;
+        }
+    }
+    return channel_first(dx);
+}
+
+// diff_x = gradient of a sliding-window maximum, with the winning positions
+// found again on this input.  The positions are produced by the forward pass
+// and read by the backward pass in the same channel-last, in-window layout, so
+// they are handed across as they are; rewriting them into the plane offsets an
+// operator carries and back would be a round trip over every pooled element
+// that changes nothing.
+std::optional<Tensor> max_pool_window_backward_core(const Tensor& grad_output, const Tensor& input,
+                                                    const PoolGeometry& g) {
+    const int index = index_of(input.device());
+    if (!grad_output.device().is_privateuse1() || index_of(grad_output.device()) != index) {
+        return std::nullopt;
+    }
+    if (grad_output.dtype() != input.dtype()) return std::nullopt;
+    auto out_sizes = pooled_sizes(input, g);
+    if (!out_sizes) return std::nullopt;
+    if (grad_output.sizes().vec() != *out_sizes) return std::nullopt;
+
+    Tensor y_cl = empty_on(to_channel_last_sizes(*out_sizes), input.dtype(), index);
+    Tensor raw_cl = empty_on(to_channel_last_sizes(*out_sizes), DType::Int64, index);
+    if (y_cl.numel() > 0) {
+        if (!launch_max_forward(channel_last(input), g, y_cl, raw_cl)) return std::nullopt;
+    }
+    Tensor dx = empty_on(channel_last_sizes(input), input.dtype(), index);
+    if (dx.numel() > 0) {
+        if (!launch_pool_backward(channel_last(input), channel_last(grad_output), &raw_cl, g,
+                                  CNNL_POOLING_MAX, dx)) {
             return std::nullopt;
         }
     }
@@ -662,6 +819,19 @@ private:
 
 // ================================================================ kernels
 
+Tensor max_pool2d_kernel(const Tensor& input, const std::vector<int64_t>& kernel_size,
+                         const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                         const std::vector<int64_t>& dilation, bool ceil_mode) {
+    const BatchAxis axis(input.dim() == 3);
+    const Tensor x = axis.lift(input);
+    if (auto g = prepare_pool(x, kernel_size, stride, padding, dilation, ceil_mode)) {
+        if (auto r = max_pool_values_core(x, *g)) return axis.lower(*r);
+    }
+    return std::get<0>(
+        cpu_fallback::Kernel<"max_pool2d_with_indices", sig::max_pool2d_with_indices>::call(
+            input, kernel_size, stride, padding, dilation, ceil_mode));
+}
+
 std::tuple<Tensor, Tensor> max_pool2d_with_indices_kernel(const Tensor& input,
                                                           const std::vector<int64_t>& kernel_size,
                                                           const std::vector<int64_t>& stride,
@@ -750,11 +920,8 @@ Tensor max_pool2d_backward_kernel(const Tensor& grad_output, const Tensor& input
     const BatchAxis axis(input.dim() == 3);
     const Tensor x = axis.lift(input);
     if (auto g = prepare_pool(x, kernel_size, stride, padding, dilation, ceil_mode)) {
-        if (auto fwd = max_pool_core(x, *g)) {
-            const Tensor idx = std::get<1>(*fwd);
-            if (auto r = pool_backward_core(axis.lift(grad_output), x, *g, true, &idx)) {
-                return axis.lower(*r);
-            }
+        if (auto r = max_pool_window_backward_core(axis.lift(grad_output), x, *g)) {
+            return axis.lower(*r);
         }
     }
     return cpu_fallback::Kernel<"max_pool2d_backward", sig::max_pool2d_backward>::call(
@@ -769,11 +936,8 @@ Tensor max_pool3d_backward_kernel(const Tensor& grad_output, const Tensor& input
     const BatchAxis axis(input.dim() == 4);
     const Tensor x = axis.lift(input);
     if (auto g = prepare_pool(x, kernel_size, stride, padding, dilation, ceil_mode)) {
-        if (auto fwd = max_pool_core(x, *g)) {
-            const Tensor idx = std::get<1>(*fwd);
-            if (auto r = pool_backward_core(axis.lift(grad_output), x, *g, true, &idx)) {
-                return axis.lower(*r);
-            }
+        if (auto r = max_pool_window_backward_core(axis.lift(grad_output), x, *g)) {
+            return axis.lower(*r);
         }
     }
     return cpu_fallback::Kernel<"max_pool3d_backward", sig::max_pool3d_backward>::call(
@@ -950,6 +1114,11 @@ Tensor adaptive_max_pool3d_backward_kernel(const Tensor& grad_output, const Tens
 } // namespace
 
 TENSORPLAY_LIBRARY_IMPL(PrivateUse1, MLUPoolKernels) {
+    // The slider without positions is registered; the 3-D one is deliberately
+    // left to the backend-neutral composite, which reaches the positions-
+    // reporting form and so keeps the derivative the operator has no formula
+    // of its own for.
+    m.impl("max_pool2d", static_cast<sig::max_pool2d*>(&max_pool2d_kernel));
     m.impl("max_pool2d_with_indices",
            static_cast<sig::max_pool2d_with_indices*>(&max_pool2d_with_indices_kernel));
     m.impl("max_pool3d_with_indices",
