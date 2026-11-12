@@ -87,6 +87,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           show-progress: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@v7
         with:
           name: dist
@@ -121,7 +124,10 @@ jobs:
       - name: Install from the GitHub release and exercise the suite
         run: |
           # Consume the release the way a user does: a fresh environment that
-          # installs the wheel fetched from the release.
+          # installs the wheel fetched from the release. The interpreter is
+          # pinned above because the hosted image's own default sits outside
+          # the range the core distributions carry, where dependency
+          # resolution fails before anything of ours is tried.
           python -m venv consumer
           consumer/bin/pip install --disable-pip-version-check --quiet \
             release-assets/*.whl pytest
