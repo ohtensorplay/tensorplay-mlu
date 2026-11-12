@@ -4,6 +4,8 @@ The two-container path (``world_size=2``) is exercised by the remote smoke
 script; here every collective is checked against a hand-computed result with
 one rank, which already covers the native entry points, the process-group
 object and the backend registration.
+
+Needs the Neuware toolkit and a Cambricon MLU; skipped otherwise.
 """
 
 import contextlib
@@ -13,7 +15,14 @@ import socket
 import pytest
 
 tp = pytest.importorskip("tensorplay")
-pytest.importorskip("tensorplay_mlu")
+tensorplay_mlu = pytest.importorskip("tensorplay_mlu")
+
+if not os.path.isfile(os.path.join(tensorplay_mlu.neuware_home(), "include", "cnnl.h")):
+    pytest.skip("Neuware toolkit not installed", allow_module_level=True)
+
+tensorplay_mlu.load()
+if not tp.mlu.is_available():
+    pytest.skip("no MLU device", allow_module_level=True)
 
 
 def _free_port() -> int:
