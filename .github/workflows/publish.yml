@@ -1,0 +1,131 @@
+name: publish
+
+# Release publisher: on a v* tag, build the sdist and the wheel, validate the
+# metadata, publish them to a GitHub release, install the wheel back the way a
+# user would and exercise the suite, and only then upload through PyPI trusted
+# publishing. A workflow_dispatch without a tag runs the build only -- releases
+# go out on tag pushes, and PyPI rejects a second upload of the same version, so
+# there is deliberately no same-version repair path.
+#
+# The wheel carries the kernel sources rather than a compiled object: the native
+# half builds against the toolkit installed on the machine that loads the
+# backend, and the result is cached under ~/.cache/tensorplay_extensions. That
+# keeps every step here device-free -- the toolkit and MLU legs of the suite
+# skip themselves on the hosted runner.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          show-progress: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check build twine
+          python -m build
+          twine check dist/*
+      - name: Install the built wheel
+        run: |
+          # A fresh interpreter with only the wheel installed: the artifact has
+          # to resolve its own dependencies.
+          python -m venv smoke
+          smoke/bin/pip install --disable-pip-version-check --quiet dist/*.whl pytest
+      - name: Check the installed wheel registers
+        run: |
+          # Registration is checked against the wheel rather than the checkout,
+          # because the wheel is what users install. Each target resolves with
+          # no toolkit present; the toolkit and device legs stay in the suite.
+          smoke/bin/python - <<'PY'
+          from importlib.metadata import entry_points
+
+          for group, name in (
+              ("tensorplay.backends", "mlu"),
+              ("tensorplay_compiler_backends", "magicmind"),
+              ("tensorplay.distributed.backends", "cncl"),
+          ):
+              matches = [e for e in entry_points(group=group) if e.name == name]
+              assert matches, f"{group} declares no {name}"
+              matches[0].load()
+          PY
+      - name: Exercise the suite against the installed wheel
+        run: |
+          # The console script keeps this checkout's package directory off the
+          # import path, so the suite runs against the wheel.
+          smoke/bin/pytest tests/ -q
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/tensorplay-mlu
+    permissions:
+      id-token: write
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          show-progress: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+      - name: Attach artifacts to the release
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "tensorplay-mlu $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          # A release created under Actions can land as a draft. A draft is
+          # invisible to consumers and its assets do not read back through the
+          # release API, so publish it before anything consumes it.
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+      - name: Download the wheel back from the release
+        run: |
+          # The release is read back the way the release pipeline always reads
+          # it: a plain download of the release assets, no URL reconstruction.
+          gh release download "${{ github.ref_name }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.whl' \
+            --dir release-assets \
+            --clobber
+          ls -l release-assets
+      - name: Install from the GitHub release and exercise the suite
+        run: |
+          # Consume the release the way a user does: a fresh environment that
+          # installs the wheel fetched from the release.
+          python -m venv consumer
+          consumer/bin/pip install --disable-pip-version-check --quiet \
+            release-assets/*.whl pytest
+          consumer/bin/python -c "import tensorplay_mlu"
+          consumer/bin/pytest tests/ -q
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
