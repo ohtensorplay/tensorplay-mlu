@@ -10,12 +10,20 @@
 // block is reused for a request within a quarter of its size.  When the
 // device runs out of memory the cache is returned to the driver and the
 // allocation retried once.
+//
+// A block handed out while a sequence of work is being recorded is marked:
+// the recording holds its address, so once the block comes back it is set
+// aside instead of being handed to anyone else.  Until the recording ends
+// such a block may still be reused, because the recorded work keeps its
+// order; see ``freeze_capture_blocks``.
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include "Allocator.h"
 #include "MLUAllocator.h"
@@ -40,6 +48,9 @@ struct Block {
     void* ptr;
     size_t size;
     int device;
+    // Handed out while a sequence was being recorded: it may be read or
+    // written on every replay, so it is kept for as long as that recording.
+    bool recorded = false;
 };
 
 struct DevicePool {
@@ -92,7 +103,7 @@ private:
             Block* block = it->second;
             pool.free_blocks.erase(it);
             note_allocated(pool, block->size);
-            return block;
+            return note_recorded(block);
         }
         void* ptr = nullptr;
         {
@@ -111,16 +122,80 @@ private:
         }
         pool.stats.reserved += static_cast<int64_t>(size);
         pool.stats.peak_reserved = std::max(pool.stats.peak_reserved, pool.stats.reserved);
-        Block* block = new Block{ptr, size, index};
+        Block* block = new Block{ptr, size, index, false};
         note_allocated(pool, size);
-        return block;
+        return note_recorded(block);
     }
 
     void give_back(Block* block) {
         std::lock_guard<std::mutex> lock(mutex_);
         DevicePool& pool = pools_.at(block->device);
         pool.stats.allocated -= static_cast<int64_t>(block->size);
+        if (block->recorded) {
+            // Recorded work still touches this block on every replay, so it
+            // waits here instead of going back into the pool.
+            held_.push_back(block);
+            return;
+        }
         pool.free_blocks.emplace(block->size, block);
+    }
+
+public:
+    void set_capture_holding(bool on) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (on) capture_allocations_.store(0, std::memory_order_relaxed);
+        holding_.store(on, std::memory_order_release);
+    }
+
+    // Blocks handed out during a recording may be reused while the recording
+    // still runs -- the recorded work keeps its order -- but not after it
+    // ends, so the ones that are unused leave the pool here.
+    void freeze_capture_blocks() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (DevicePool& pool : pools_) {
+            for (auto it = pool.free_blocks.begin(); it != pool.free_blocks.end();) {
+                if (it->second->recorded) {
+                    held_.push_back(it->second);
+                    it = pool.free_blocks.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    void drop_capture_blocks() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (held_.empty()) return;
+        for (int index = 0; index < device_count(); ++index) {
+            DeviceGuard guard(index);
+            cnrtQueueSync(queue(index));
+        }
+        for (Block* block : held_) {
+            DeviceGuard guard(block->device);
+            cnrtFree(block->ptr);
+            pools_.at(block->device).stats.reserved -= static_cast<int64_t>(block->size);
+            delete block;
+        }
+        held_.clear();
+    }
+
+    int64_t capture_allocations() const {
+        return capture_allocations_.load(std::memory_order_relaxed);
+    }
+
+    int64_t capture_blocks() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<int64_t>(held_.size());
+    }
+
+private:
+    // Caller holds mutex_.
+    Block* note_recorded(Block* block) const {
+        if (!holding_.load(std::memory_order_acquire)) return block;
+        block->recorded = true;
+        capture_allocations_.fetch_add(1, std::memory_order_relaxed);
+        return block;
     }
 
     static void note_allocated(DevicePool& pool, size_t size) {
@@ -154,6 +229,11 @@ public:
 private:
     mutable std::mutex mutex_;
     mutable std::array<DevicePool, kMaxDevices> pools_;
+    // Recording support: blocks handed out while a sequence is recorded, and
+    // the ones set aside because a recording still touches them.
+    mutable std::atomic<bool> holding_{false};
+    mutable std::vector<Block*> held_;
+    mutable std::atomic<int64_t> capture_allocations_{0};
 };
 
 static ::tensorplay::detail::AllocatorRegisterer g_register_allocator(
@@ -168,6 +248,16 @@ MemoryStats memory_stats(int index) { return CachingAllocator::instance().stats(
 void reset_peak_memory_stats(int index) { CachingAllocator::instance().reset_peak(index); }
 
 void empty_cache() { CachingAllocator::instance().empty_cache(); }
+
+void set_capture_holding(bool on) { CachingAllocator::instance().set_capture_holding(on); }
+
+void freeze_capture_blocks() { CachingAllocator::instance().freeze_capture_blocks(); }
+
+void drop_capture_blocks() { CachingAllocator::instance().drop_capture_blocks(); }
+
+int64_t capture_allocations() { return CachingAllocator::instance().capture_allocations(); }
+
+int64_t capture_blocks() { return CachingAllocator::instance().capture_blocks(); }
 
 } // namespace mlu
 } // namespace tensorplay

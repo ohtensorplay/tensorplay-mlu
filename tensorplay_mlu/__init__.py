@@ -78,6 +78,18 @@ def load(verbose: bool = False) -> None:
         lib.tp_mlu_device_count.restype = ctypes.c_int
         lib.tp_mlu_memory_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int64)]
         lib.tp_mlu_reset_peak_memory_stats.argtypes = [ctypes.c_int]
+        lib.tp_mlu_last_error.restype = ctypes.c_char_p
+        lib.tp_mlu_capture_ready.restype = ctypes.c_int
+        lib.tp_mlu_capture_stats.argtypes = [ctypes.POINTER(ctypes.c_int64)]
+        for entry in (
+            lib.tp_mlu_capture_begin,
+            lib.tp_mlu_capture_end,
+            lib.tp_mlu_capture_invoke,
+        ):
+            entry.argtypes = [ctypes.c_int]
+            entry.restype = ctypes.c_int
+        lib.tp_mlu_capture_reset.argtypes = []
+        lib.tp_mlu_capture_reset.restype = ctypes.c_int
         _LIB = lib
 
         tp.utils.rename_privateuse1_backend("mlu")

@@ -22,5 +22,17 @@ void reset_peak_memory_stats(int index);
 // Return every cached, unused block to the driver.
 void empty_cache();
 
+// Recording a sequence of device work bakes the addresses it touches into the
+// recording, so those blocks may not be handed out again.  While a recording
+// is running every block handed out is marked; ``freeze_capture_blocks`` moves
+// the marked blocks that are currently unused out of the pool, and the ones
+// still held by a tensor are set aside when they come back.
+void set_capture_holding(bool on);
+void freeze_capture_blocks();
+void drop_capture_blocks();
+// Blocks handed out while recording, and blocks set aside for a recording.
+int64_t capture_allocations();
+int64_t capture_blocks();
+
 } // namespace mlu
 } // namespace tensorplay
