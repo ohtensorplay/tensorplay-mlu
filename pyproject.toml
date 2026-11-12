@@ -23,6 +23,11 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+# The suite needs the runner. The toolkit, the card, and the SDK legs skip
+# themselves when absent, so no vendor package belongs in this extra.
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.urls]
 Homepage = "https://github.com/ohtensorplay/tensorplay-mlu"
 Repository = "https://github.com/ohtensorplay/tensorplay-mlu"

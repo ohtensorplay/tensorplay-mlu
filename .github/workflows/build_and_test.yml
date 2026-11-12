@@ -1,0 +1,55 @@
+name: build_and_test
+
+# Structure tests on every push and pull request: the kernel sources and their
+# loader contract, the graph bridge driven against stand-in bindings, the
+# settings parsing, and the missing-toolkit error path. The numeric kernel legs
+# compare against the same computation on the host and skip themselves on
+# hosted runners, where neither the Neuware toolkit nor an MLU is present.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: read-all
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          show-progress: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -e .[dev]
+      - name: Check backend registration
+        run: |
+          # Discovery for this package goes through entry points, so a target
+          # that no longer resolves is a release-blocking failure even though
+          # importing the package by hand still works. Resolving is all this
+          # step asks of them; the toolkit and device legs stay in the suite.
+          python - <<'PY'
+          from importlib.metadata import entry_points
+
+          for group, name in (
+              ("tensorplay.backends", "mlu"),
+              ("tensorplay_compiler_backends", "magicmind"),
+              ("tensorplay.distributed.backends", "cncl"),
+          ):
+              matches = [e for e in entry_points(group=group) if e.name == name]
+              assert matches, f"{group} declares no {name}"
+              matches[0].load()
+          print("backend entry points resolve")
+          PY
+      - name: Run tests
+        run: python -m pytest tests/ -q
